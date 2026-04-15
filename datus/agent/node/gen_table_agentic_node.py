@@ -43,19 +43,24 @@ class GenTableAgenticNode(AgenticNode):
         self,
         agent_config: AgentConfig,
         execution_mode: Literal["interactive", "workflow"] = "interactive",
+        node_id: Optional[str] = None,
+        node_name: Optional[str] = None,
     ):
         self.execution_mode = execution_mode
+        # Support custom node_name for alias subagents (e.g. my_table: {node_class: gen_table})
+        self._configured_node_name = node_name or self.NODE_NAME
 
         self.max_turns = 20
-        if agent_config and hasattr(agent_config, "agentic_nodes") and self.NODE_NAME in agent_config.agentic_nodes:
-            agentic_node_config = agent_config.agentic_nodes[self.NODE_NAME]
+        config_key = self._configured_node_name
+        if agent_config and hasattr(agent_config, "agentic_nodes") and config_key in agent_config.agentic_nodes:
+            agentic_node_config = agent_config.agentic_nodes[config_key]
             if isinstance(agentic_node_config, dict):
                 self.max_turns = agentic_node_config.get("max_turns", 20)
 
         from datus.configuration.node_type import NodeType
 
         super().__init__(
-            node_id=f"{self.NODE_NAME}_node",
+            node_id=node_id or f"{self.NODE_NAME}_node",
             description=f"Table generation node: {self.NODE_NAME}",
             node_type=NodeType.TYPE_GEN_TABLE,
             input_data=None,
@@ -69,7 +74,7 @@ class GenTableAgenticNode(AgenticNode):
         self.setup_tools()
 
     def get_node_name(self) -> str:
-        return self.NODE_NAME
+        return self._configured_node_name
 
     def setup_tools(self):
         if not self.agent_config:
@@ -87,7 +92,7 @@ class GenTableAgenticNode(AgenticNode):
         try:
             self.db_func_tool = DBFuncTool.create_dynamic(
                 self.agent_config,
-                sub_agent_name=self.NODE_NAME,
+                sub_agent_name=self._configured_node_name,
             )
             # Standard read-only tools (list_tables, describe_table, read_query, etc.)
             self.tools.extend(self.db_func_tool.available_tools())
