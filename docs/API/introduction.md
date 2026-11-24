@@ -25,6 +25,26 @@ X-Datus-User-Id: alice
 Datasource isolation is controlled separately by the `--datasource` CLI flag (or `DATUS_DATASOURCE` env var) and selects
 which datasource from `agent.yml` is used to load databases and knowledge.
 
+### Optional bearer token (remote deployments)
+
+The header scheme above trusts its caller, so it is only appropriate on loopback. When the API is exposed beyond
+`127.0.0.1` — for example the Datus desktop client connecting to a shared server — set `DATUS_API_TOKEN` before
+launching `datus-api`:
+
+```bash
+export DATUS_API_TOKEN="$(openssl rand -hex 32)"
+datus-api --host 0.0.0.0 --port 8000 --datasource demo
+```
+
+Every request must then send the matching header; `/health` and `/health/live` stay open for probes and CORS
+preflight requests are unaffected.
+
+```
+Authorization: Bearer <token>
+```
+
+Serve the API behind TLS (a reverse proxy or `https://` terminator) whenever the token crosses a network.
+
 ## Response envelope
 
 Almost every JSON response is wrapped in a generic `Result[T]` envelope:
@@ -50,8 +70,8 @@ Streaming endpoints (`/chat/stream`, `/chat/resume`) return `text/event-stream` 
 
 ## Global URL prefix
 
-All v1 endpoints live under `/api/v1`. Health check (`/health`) and the OpenAPI/Swagger UI (`/docs`, `/openapi.json`)
-sit at the application root.
+All v1 endpoints live under `/api/v1`. Health check (`/health`), the lightweight liveness probe (`/health/live`) and
+the OpenAPI/Swagger UI (`/docs`, `/openapi.json`) sit at the application root.
 
 ## Troubleshooting
 

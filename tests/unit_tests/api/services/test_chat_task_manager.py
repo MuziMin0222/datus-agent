@@ -1231,6 +1231,52 @@ class TestChatTaskManagerBehavior:
         assert mock_apply.call_args.args[1] == ["write_file", "edit_file", "delete_file"]
         assert task.status == "completed"
 
+    @pytest.mark.asyncio
+    async def test_run_loop_desktop_source_runs_filesystem_server_side(self, real_agent_config):
+        """source='desktop' never proxies: the remote client owns a different
+        filesystem than the server workspace, so even the normal profile must
+        execute filesystem tools server-side and advertise proxied=False."""
+
+        from datus.api.models.cli_models import StreamChatInput
+
+        class FakeNode:
+            session_id = "s-desktop-proxy"
+            permission_manager = PermissionManager(global_config=get_profile("normal"), active_profile="normal")
+
+            def __init__(self):
+                # Simulate a pre-populated shared set (PermissionHooks may hold
+                # a reference): the desktop path must clear it in place.
+                self.proxied_tool_names = {"write_file"}
+
+            def get_node_name(self):
+                return "chat"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                return
+                yield  # pragma: no cover - makes this an async generator
+
+            async def get_last_turn_usage(self):
+                return None
+
+        node = FakeNode()
+        shared_ref = node.proxied_tool_names
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: node  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-desktop-proxy", asyncio_task=MagicMock())
+
+        with patch("datus.api.services.chat_task_manager.apply_proxy_tools") as mock_apply:
+            await manager._run_loop(
+                task,
+                real_agent_config,
+                StreamChatInput(message="hi", source="desktop", session_id="s-desktop-proxy"),
+            )
+
+        mock_apply.assert_not_called()
+        assert node.proxied_tool_names is shared_ref
+        assert shared_ref == set()
+        assert task.status == "completed"
+
     def test_include_final_response_rejects_nested_subagent_response(self):
         """Depth>0 sub-agent wrappers must not render as top-level answers."""
         from datus.schemas.action_history import ActionHistory, ActionRole, ActionStatus
@@ -2605,6 +2651,34 @@ class TestStartChatRemoteSourceHardening:
         assert cfg._client_source == "web"
         # Source config remains untouched because start_chat deep-copies.
         assert real_agent_config.bash_allowed_patterns == ["*"]
+        assert real_agent_config.bash_sandbox.enabled is False
+
+    @pytest.mark.asyncio
+    async def test_desktop_source_allows_all_bash_under_strict_sandbox(self, real_agent_config, monkeypatch):
+        """The remote desktop source keeps the web bash posture (full commands
+        under the strict OS sandbox) while filesystem tools stay server-side."""
+        from datus.api.models.cli_models import StreamChatInput
+
+        real_agent_config.bash_tool_enabled = True
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["agent_config"] = agent_config
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hi", source="desktop", session_id="desktop-hardening")
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+
+        cfg = captured["agent_config"]
+        assert cfg.filesystem_strict is True
+        assert cfg.bash_tool_enabled is True
+        assert cfg.bash_allowed_patterns == ["*"]
+        assert cfg.bash_sandbox.enabled is True
+        assert cfg.bash_sandbox.is_strict is True
+        assert cfg._client_source == "desktop"
+        # Source config remains untouched because start_chat deep-copies.
         assert real_agent_config.bash_sandbox.enabled is False
 
     @pytest.mark.asyncio

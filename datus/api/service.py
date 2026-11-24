@@ -15,12 +15,14 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
+from datus import __version__ as datus_version
 from datus.agent.agent import Agent
 from datus.api.auth import load_auth_provider
+from datus.api.auth.token_middleware import install_token_auth
 from datus.api.deps import init_deps
 from datus.api.services.background_drain import drain_background_tasks
 from datus.api.services.datus_service_cache import DatusServiceCache
-from datus.configuration.agent_config_loader import load_agent_config, parse_config_path
+from datus.configuration.agent_config_loader import configuration_manager, load_agent_config, parse_config_path
 from datus.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
 from datus.schemas.node_models import SqlTask
 from datus.storage.task import TaskStore
@@ -434,6 +436,13 @@ async def lifespan(app: FastAPI):
     """Handle application lifecycle."""
     global service
     args = getattr(app.state, "agent_args", None)
+    # Pin the singleton configuration manager to the launch config path so
+    # ``PUT /api/v1/config/*`` writes the file the server was started with,
+    # instead of falling back to ./conf/agent.yml or ~/.datus/conf/agent.yml.
+    # The desktop client relies on this to keep its backend config app-private.
+    config_path = (getattr(args, "config", "") or os.getenv("DATUS_CONFIG") or "").strip()
+    if config_path:
+        configuration_manager(config_path)
     service = DatusAPIService(args)
 
     # Startup
@@ -535,6 +544,16 @@ def create_app(agent_args: argparse.Namespace) -> FastAPI:
         """Root endpoint with API information."""
         return {"message": "Datus Agent API", "version": "1.0.0", "docs": "/docs", "health": "/health"}
 
+    @app.get("/health/live", tags=["health"])
+    async def health_live():
+        """Lightweight liveness probe without DB/LLM round-trips.
+
+        ``/health`` intentionally probes the datasource and model, which can
+        take seconds; process-supervisors and the desktop client poll this
+        endpoint instead while waiting for startup.
+        """
+        return {"status": "ok", "ready": True, "version": datus_version}
+
     @app.get("/health", response_model=HealthResponse, tags=["health"])
     async def health_check() -> HealthResponse:
         """Health check endpoint (no authentication required)."""
@@ -601,6 +620,10 @@ def create_app(agent_args: argparse.Namespace) -> FastAPI:
         except Exception as e:
             logger.error(f"Feedback recording error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+
+    # Opt-in bearer-token gate for remote deployments. No-op unless
+    # DATUS_API_TOKEN is set, so loopback-only usage stays unchanged.
+    install_token_auth(app)
 
     return app
 

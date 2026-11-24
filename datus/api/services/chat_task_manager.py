@@ -597,6 +597,13 @@ class ChatTaskManager:
             agent_config.bash_allowed_patterns = WEB_BASH_ALLOWED_PATTERNS
             agent_config.bash_sandbox.enabled = True
             agent_config.bash_sandbox.mode = "strict"
+        elif effective_source == "desktop":
+            # The remote desktop client cannot execute anything on the server
+            # host, so its filesystem tools stay server-side (strict). Bash
+            # keeps the same full-command + strict-sandbox posture as web.
+            agent_config.bash_allowed_patterns = WEB_BASH_ALLOWED_PATTERNS
+            agent_config.bash_sandbox.enabled = True
+            agent_config.bash_sandbox.mode = "strict"
         # Stash the resolved source on the cloned config so downstream nodes
         # can adapt prompt-side hints to the front-end (e.g. vscode renders
         # the literal "." for the SQL files root because the IDE owns its own
@@ -923,7 +930,7 @@ class ChatTaskManager:
 
         try:
             start_time = datetime.now()
-            if (request.source or self._default_source) == "web":
+            if (request.source or self._default_source) in ("web", "desktop"):
                 semantic_snapshot = await asyncio.to_thread(SemanticModelSnapshot.capture, agent_config.project_root)
 
             # Snapshot the turn counter BEFORE the run so the @-context persist
@@ -1116,6 +1123,15 @@ class ChatTaskManager:
                     from datus.tools.proxy.semantic_plan_review import apply_semantic_plan_review
 
                     apply_semantic_plan_review(node)
+            elif effective_source == "desktop":
+                # A remote desktop client owns a different filesystem than the
+                # server workspace, so proxying would write to the wrong host.
+                # Leave every tool server-side and advertise proxied=False.
+                existing_proxied = getattr(node, "proxied_tool_names", None)
+                if isinstance(existing_proxied, set):
+                    existing_proxied.clear()
+                else:
+                    node.proxied_tool_names = set()
             elif effective_source:
                 logger.warning("Unsupported source '%s'; skipping proxy shortcut", effective_source)
 

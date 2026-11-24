@@ -3,6 +3,8 @@
 import argparse
 from unittest.mock import patch
 
+from fastapi.testclient import TestClient
+
 from datus.api.service import DatusAPIService, create_app
 
 
@@ -49,6 +51,48 @@ class TestCreateApp:
         # Check that at least some v1 routes are registered
         has_api_routes = any("/api/" in p for p in route_paths)
         assert has_api_routes
+
+
+class TestLivenessAndTokenAuth:
+    """Liveness probe and the opt-in bearer-token gate."""
+
+    @staticmethod
+    def _args() -> argparse.Namespace:
+        return argparse.Namespace(config="", datasource="default", output_dir="./output", log_level="INFO")
+
+    def test_create_app_registers_liveness_route(self):
+        app = create_app(self._args())
+        route_paths = {route.path for route in app.routes if hasattr(route, "path")}
+        assert "/health/live" in route_paths
+
+    def test_health_live_answers_without_lifespan(self):
+        """The probe must not depend on DatusAPIService or DB/LLM setup."""
+        app = create_app(self._args())
+        # Constructing TestClient without entering it skips the lifespan, so
+        # ``service`` stays uninitialised — exactly what a startup poll sees.
+        client = TestClient(app)
+        response = client.get("/health/live")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "ok"
+        assert payload["ready"] is True
+        assert payload["version"]
+
+    def test_token_auth_protects_non_health_routes(self, monkeypatch):
+        monkeypatch.setenv("DATUS_API_TOKEN", "secret")
+        app = create_app(self._args())
+        client = TestClient(app)
+
+        assert client.get("/").status_code == 401
+        assert client.get("/", headers={"Authorization": "Bearer secret"}).status_code == 200
+        # Health probes stay reachable for supervisors and readiness polling.
+        assert client.get("/health/live").status_code == 200
+
+    def test_token_auth_disabled_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv("DATUS_API_TOKEN", raising=False)
+        app = create_app(self._args())
+        client = TestClient(app)
+        assert client.get("/").status_code == 200
 
 
 class TestDatusAPIServiceInit:

@@ -193,6 +193,14 @@ class TestConfigurationManagerSingleton:
         # Without reload, returns the same cached instance
         assert m1 is m2
 
+    def test_noarg_call_after_explicit_path_returns_pinned_instance(self, tmp_path):
+        """Route handlers call ``configuration_manager()`` with no path; the
+        explicit path pinned at startup must win."""
+        cfg = tmp_path / "agent.yml"
+        cfg.write_text(yaml.safe_dump({"agent": {"v": 1}}))
+        m1 = configuration_manager(str(cfg), reload=True)
+        assert configuration_manager() is m1
+
     def test_explicit_different_path_replaces_cached_instance(self, tmp_path):
         cfg1 = tmp_path / "agent1.yml"
         cfg1.write_text(yaml.safe_dump({"agent": {"v": 1}}))

@@ -173,7 +173,7 @@ class ChatInput(BaseModel):
         ),
     )
     plan_mode: bool = Field(False, description="Whether in plan mode")
-    source: Optional[str] = Field(None, description="chat source, web/vscode")
+    source: Optional[str] = Field(None, description="chat source: web/vscode/desktop")
     interactive: Optional[bool] = Field(
         default=None,
         description="Override server default for ask_user interactive tool. None = use server default.",

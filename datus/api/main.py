@@ -252,11 +252,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--source",
         type=str,
         default=None,
-        choices=["web", "vscode"],
+        choices=["web", "vscode", "desktop"],
         help=(
             "Default proxy tool source shortcut. 'vscode' -> proxy filesystem_tools.* and no "
             "server-side bash, 'web' -> proxy write_file/edit_file/delete_file with a "
-            "server-side bash restricted to datus commands. "
+            "server-side bash confined by the strict OS sandbox, 'desktop' -> same bash policy "
+            "as web but all filesystem tools run server-side (remote desktop client). "
             "Overridable per request via ChatInput.source."
         ),
     )
