@@ -2,6 +2,14 @@
 
 ## 0.4
 
+### 0.4.6
+
+**Bug Fixes**
+
+- Desktop configuration now supports deleting active and last models/datasources; deleting the active datasource selects a remaining default, and deleting the last model clears `target`.
+- Project-level `.datus/config.yml` `target` and `default_datasource` values are synchronized so deleted configuration cannot reappear after reload; provider-level active models remain active when custom models are deleted.
+- Failed updates to `agent.yml` and the project override file roll back in-memory state and the project override instead of leaving a partial update.
+
 ### 0.4.5
 
 **New Features**

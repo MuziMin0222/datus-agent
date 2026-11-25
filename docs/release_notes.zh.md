@@ -2,6 +2,14 @@
 
 ## 0.4
 
+### 0.4.6
+
+**Bug 修复**
+
+- 桌面端配置支持删除 active 和最后一个模型/数据源；删除 active 数据源时自动选择剩余默认项，删除最后一个模型时清空 `target`。
+- 同步项目级 `.datus/config.yml` 中的 `target` 与 `default_datasource`，已删除的配置不会在重新加载时被恢复；删除自定义模型时保留 provider 级 active model。
+- `agent.yml` 与项目覆盖文件更新失败时回滚内存和已写入的项目覆盖，避免留下半更新配置。
+
 ### 0.4.5
 
 **新功能**
