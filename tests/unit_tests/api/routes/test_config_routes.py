@@ -21,16 +21,35 @@ from datus.api.routes.config_routes import (
     update_datasources_endpoint,
     update_models_endpoint,
 )
+from datus.configuration.project_config import (
+    ProjectOverride,
+    ProjectTarget,
+    load_project_override,
+    save_project_override,
+)
 from datus.utils.exceptions import DatusException
 
 
-def _mock_svc(datasources, *, target="deepseek", current_datasource="starrocks", models=None, home="~/.datus"):
+def _mock_svc(
+    datasources,
+    *,
+    target="deepseek",
+    current_datasource="starrocks",
+    models=None,
+    home="~/.datus",
+    project_root=".",
+    target_provider=None,
+    target_model=None,
+):
     svc = MagicMock()
     svc.agent_config.target = target
     svc.agent_config.models = models if models is not None else {}
     svc.agent_config.current_datasource = current_datasource
     svc.agent_config.datasource_configs = datasources
     svc.agent_config.home = home
+    svc.agent_config.project_root = project_root
+    svc.agent_config._target_provider = target_provider
+    svc.agent_config._target_model = target_model
     return svc
 
 
@@ -186,6 +205,16 @@ async def test_get_agent_config_handles_empty_datasources():
     assert result.data["datasources"] == {}
 
 
+@pytest.mark.asyncio
+async def test_get_agent_config_includes_provider_target():
+    svc = _mock_svc(datasources={}, target_provider="openai", target_model="gpt-4.1")
+
+    result = await get_agent_config_endpoint(svc)
+
+    assert result.data["target_provider"] == "openai"
+    assert result.data["target_model"] == "gpt-4.1"
+
+
 class _FakeConfigManager:
     """Minimal stand-in for ConfigurationManager — captures save() calls."""
 
@@ -252,6 +281,101 @@ async def test_update_datasources_empty_dict_clears_block(patched_cm, patched_ca
 
 
 @pytest.mark.asyncio
+async def test_update_datasources_replaces_deleted_project_default(patched_cm, patched_cache, tmp_path):
+    save_project_override(
+        ProjectOverride(default_datasource="old", project_name="keep"),
+        cwd=str(tmp_path),
+    )
+    patched_cm.data = {"services": {"datasources": {"old": {"type": "sqlite"}}}}
+    svc = _mock_svc({}, current_datasource="old", project_root=str(tmp_path))
+
+    await update_datasources_endpoint(
+        UpdateDatasourcesRequest(datasources={"new": {"type": "duckdb", "default": True}}),
+        svc=svc,
+        ctx=_ctx(),
+    )
+
+    override = load_project_override(cwd=str(tmp_path))
+    assert override.default_datasource == "new"
+    assert override.project_name == "keep"
+
+
+@pytest.mark.asyncio
+async def test_update_datasources_clears_deleted_project_default(patched_cm, patched_cache, tmp_path):
+    save_project_override(
+        ProjectOverride(default_datasource="only", project_name="keep"),
+        cwd=str(tmp_path),
+    )
+    patched_cm.data = {"services": {"datasources": {"only": {"type": "sqlite"}}}}
+    svc = _mock_svc({}, current_datasource="only", project_root=str(tmp_path))
+
+    await update_datasources_endpoint(UpdateDatasourcesRequest(datasources={}), svc=svc, ctx=_ctx())
+
+    override = load_project_override(cwd=str(tmp_path))
+    assert override.default_datasource is None
+    assert override.project_name == "keep"
+
+
+@pytest.mark.asyncio
+async def test_update_datasources_project_override_failure_keeps_global_config(
+    patched_cm, patched_cache, tmp_path, monkeypatch
+):
+    save_project_override(
+        ProjectOverride(default_datasource="old", project_name="keep"),
+        cwd=str(tmp_path),
+    )
+    patched_cm.data = {"services": {"datasources": {"old": {"type": "sqlite"}}, "other": "keep"}}
+    svc = _mock_svc({}, current_datasource="old", project_root=str(tmp_path))
+
+    def fail_override_save(*args, **kwargs):
+        raise OSError("project override write failed")
+
+    monkeypatch.setattr(config_routes, "save_project_override", fail_override_save)
+
+    with pytest.raises(OSError, match="project override write failed"):
+        await update_datasources_endpoint(
+            UpdateDatasourcesRequest(datasources={"new": {"type": "duckdb", "default": True}}),
+            svc=svc,
+            ctx=_ctx(),
+        )
+
+    assert patched_cm.save_count == 0
+    assert patched_cm.data == {"services": {"datasources": {"old": {"type": "sqlite"}}, "other": "keep"}}
+    assert load_project_override(cwd=str(tmp_path)).default_datasource == "old"
+    patched_cache.evict.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_datasources_global_save_failure_rolls_back_project_override(
+    patched_cm, patched_cache, tmp_path, monkeypatch
+):
+    save_project_override(
+        ProjectOverride(default_datasource="old", project_name="keep"),
+        cwd=str(tmp_path),
+    )
+    patched_cm.data = {"services": {"datasources": {"old": {"type": "sqlite"}}, "other": "keep"}}
+    svc = _mock_svc({}, current_datasource="old", project_root=str(tmp_path))
+
+    def fail_global_save():
+        raise OSError("global config write failed")
+
+    monkeypatch.setattr(patched_cm, "save", fail_global_save)
+
+    with pytest.raises(OSError, match="global config write failed"):
+        await update_datasources_endpoint(
+            UpdateDatasourcesRequest(datasources={"new": {"type": "duckdb", "default": True}}),
+            svc=svc,
+            ctx=_ctx(),
+        )
+
+    assert patched_cm.data == {"services": {"datasources": {"old": {"type": "sqlite"}}, "other": "keep"}}
+    override = load_project_override(cwd=str(tmp_path))
+    assert override.default_datasource == "old"
+    assert override.project_name == "keep"
+    patched_cache.evict.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_update_datasources_rejects_invalid_name(patched_cm, patched_cache):
     body = UpdateDatasourcesRequest(datasources={"bad name!": {"type": "duckdb"}})
     with pytest.raises(DatusException):
@@ -312,6 +436,179 @@ async def test_update_models_models_only(patched_cm, patched_cache):
 
     assert patched_cm.data["models"] == {"old": {"type": "openai"}}
     assert patched_cm.data["target"] == "old"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("project_target", ["old", ProjectTarget(custom="old")])
+async def test_update_models_models_only_replaces_stale_targets(patched_cm, patched_cache, tmp_path, project_target):
+    save_project_override(
+        ProjectOverride(target=project_target, project_name="keep"),
+        cwd=str(tmp_path),
+    )
+    patched_cm.data = {"models": {"old": {}}, "target": "old"}
+    svc = _mock_svc({}, project_root=str(tmp_path))
+
+    await update_models_endpoint(
+        UpdateModelsRequest(models={"keep": {"type": "openai"}}),
+        svc=svc,
+        ctx=_ctx(),
+    )
+
+    assert patched_cm.data["target"] == "keep"
+    override = load_project_override(cwd=str(tmp_path))
+    assert override.target == ProjectTarget(custom="keep")
+    assert override.project_name == "keep"
+
+
+@pytest.mark.asyncio
+async def test_update_models_models_only_clears_stale_targets(patched_cm, patched_cache, tmp_path):
+    save_project_override(
+        ProjectOverride(target=ProjectTarget(custom="only"), project_name="keep"),
+        cwd=str(tmp_path),
+    )
+    patched_cm.data = {"models": {"only": {}}, "target": "only"}
+    svc = _mock_svc({}, project_root=str(tmp_path))
+
+    await update_models_endpoint(UpdateModelsRequest(models={}), svc=svc, ctx=_ctx())
+
+    assert "target" not in patched_cm.data
+    override = load_project_override(cwd=str(tmp_path))
+    assert override.target is None
+    assert override.project_name == "keep"
+
+
+@pytest.mark.asyncio
+async def test_update_models_models_only_preserves_provider_project_target(patched_cm, patched_cache, tmp_path):
+    provider_target = ProjectTarget(provider="openai", model="gpt-4.1")
+    save_project_override(
+        ProjectOverride(target=provider_target, project_name="keep"),
+        cwd=str(tmp_path),
+    )
+    patched_cm.data = {"models": {"only": {}}, "target": "only"}
+    svc = _mock_svc({}, project_root=str(tmp_path))
+
+    await update_models_endpoint(UpdateModelsRequest(models={}), svc=svc, ctx=_ctx())
+
+    assert "target" not in patched_cm.data
+    override = load_project_override(cwd=str(tmp_path))
+    assert override.target == provider_target
+    assert override.project_name == "keep"
+
+
+@pytest.mark.asyncio
+async def test_update_models_can_clear_target_when_last_model_is_deleted(patched_cm, patched_cache):
+    patched_cm.data = {"models": {"only": {"type": "openai"}}, "target": "only"}
+
+    result = await update_models_endpoint(
+        UpdateModelsRequest(models={}, target=None),
+        svc=MagicMock(),
+        ctx=_ctx(),
+    )
+
+    assert result.data["updated"] is True
+    assert patched_cm.data["models"] == {}
+    assert "target" not in patched_cm.data
+    assert patched_cm.save_count == 1
+    patched_cache.evict.assert_awaited_once_with("proj_a")
+
+
+@pytest.mark.asyncio
+async def test_update_models_replaces_deleted_project_target(patched_cm, patched_cache, tmp_path):
+    save_project_override(
+        ProjectOverride(target=ProjectTarget(custom="old"), project_name="keep"),
+        cwd=str(tmp_path),
+    )
+    patched_cm.data = {"models": {"old": {"type": "openai"}}, "target": "old"}
+    svc = _mock_svc({}, project_root=str(tmp_path))
+
+    await update_models_endpoint(
+        UpdateModelsRequest(models={"new": {"type": "openai"}}, target="new"),
+        svc=svc,
+        ctx=_ctx(),
+    )
+
+    override = load_project_override(cwd=str(tmp_path))
+    assert override.target == ProjectTarget(custom="new")
+    assert override.project_name == "keep"
+
+
+@pytest.mark.asyncio
+async def test_update_models_clears_deleted_project_target(patched_cm, patched_cache, tmp_path):
+    save_project_override(
+        ProjectOverride(target=ProjectTarget(custom="only"), project_name="keep"),
+        cwd=str(tmp_path),
+    )
+    patched_cm.data = {"models": {"only": {"type": "openai"}}, "target": "only"}
+    svc = _mock_svc({}, project_root=str(tmp_path))
+
+    await update_models_endpoint(
+        UpdateModelsRequest(models={}, target=None),
+        svc=svc,
+        ctx=_ctx(),
+    )
+
+    override = load_project_override(cwd=str(tmp_path))
+    assert override.target is None
+    assert override.project_name == "keep"
+
+
+@pytest.mark.asyncio
+async def test_update_models_project_override_failure_keeps_global_config(
+    patched_cm, patched_cache, tmp_path, monkeypatch
+):
+    save_project_override(
+        ProjectOverride(target=ProjectTarget(custom="old"), project_name="keep"),
+        cwd=str(tmp_path),
+    )
+    patched_cm.data = {"models": {"old": {"type": "openai"}}, "target": "old"}
+    svc = _mock_svc({}, project_root=str(tmp_path))
+
+    def fail_override_save(*args, **kwargs):
+        raise OSError("project override write failed")
+
+    monkeypatch.setattr(config_routes, "save_project_override", fail_override_save)
+
+    with pytest.raises(OSError, match="project override write failed"):
+        await update_models_endpoint(
+            UpdateModelsRequest(models={"new": {"type": "openai"}}, target="new"),
+            svc=svc,
+            ctx=_ctx(),
+        )
+
+    assert patched_cm.save_count == 0
+    assert patched_cm.data == {"models": {"old": {"type": "openai"}}, "target": "old"}
+    assert load_project_override(cwd=str(tmp_path)).target == ProjectTarget(custom="old")
+    patched_cache.evict.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_models_global_save_failure_rolls_back_project_override(
+    patched_cm, patched_cache, tmp_path, monkeypatch
+):
+    save_project_override(
+        ProjectOverride(target=ProjectTarget(custom="old"), project_name="keep"),
+        cwd=str(tmp_path),
+    )
+    patched_cm.data = {"models": {"old": {"type": "openai"}}, "target": "old"}
+    svc = _mock_svc({}, project_root=str(tmp_path))
+
+    def fail_global_save():
+        raise OSError("global config write failed")
+
+    monkeypatch.setattr(patched_cm, "save", fail_global_save)
+
+    with pytest.raises(OSError, match="global config write failed"):
+        await update_models_endpoint(
+            UpdateModelsRequest(models={"new": {"type": "openai"}}, target="new"),
+            svc=svc,
+            ctx=_ctx(),
+        )
+
+    assert patched_cm.data == {"models": {"old": {"type": "openai"}}, "target": "old"}
+    override = load_project_override(cwd=str(tmp_path))
+    assert override.target == ProjectTarget(custom="old")
+    assert override.project_name == "keep"
+    patched_cache.evict.assert_not_awaited()
 
 
 @pytest.mark.asyncio

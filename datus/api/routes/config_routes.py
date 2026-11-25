@@ -6,6 +6,7 @@ and supported provider/database type listings.
 """
 
 import asyncio
+from copy import deepcopy
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter
@@ -17,6 +18,12 @@ from datus.api.models.base_models import Result
 from datus.api.models.config_models import DatasourceListData, DatasourceSummary
 from datus.configuration.agent_config import _SAFE_NAME_RE, DbConfig, load_model_config
 from datus.configuration.agent_config_loader import configuration_manager
+from datus.configuration.project_config import (
+    ProjectOverride,
+    ProjectTarget,
+    load_project_override,
+    save_project_override,
+)
 from datus.models.base import LLMBaseModel
 from datus.utils.exceptions import DatusException, ErrorCode
 from datus.utils.loggings import get_logger
@@ -118,6 +125,29 @@ async def _evict_current_project(project_id: str) -> None:
         logger.exception(f"Failed to evict service cache for project {project_id}")
 
 
+def _save_config_updates(
+    cm: Any,
+    data: Dict[str, Any],
+    project_root: str,
+    previous_override: Optional[ProjectOverride],
+    updated_override: Optional[ProjectOverride],
+) -> None:
+    previous_data = cm.data
+    cm.data = data
+    try:
+        if updated_override is not None:
+            save_project_override(updated_override, cwd=project_root)
+        cm.save()
+    except Exception:
+        cm.data = previous_data
+        if updated_override is not None and previous_override is not None:
+            try:
+                save_project_override(previous_override, cwd=project_root)
+            except Exception:
+                logger.exception(f"Failed to roll back project override at {project_root}")
+        raise
+
+
 @router.get(
     "/config/agent",
     response_model=Result[dict],
@@ -140,6 +170,8 @@ async def get_agent_config_endpoint(
         success=True,
         data={
             "target": config.target,
+            "target_provider": getattr(config, "_target_provider", None),
+            "target_model": getattr(config, "_target_model", None),
             "models": config.models,
             "current_datasource": config.current_datasource,
             "datasources": flat_datasources,
@@ -211,10 +243,19 @@ async def update_datasources_endpoint(
     _validate_keys(body.datasources, kind="datasource")
 
     cm = configuration_manager()
-    services = cm.data.setdefault("services", {})
+    data = deepcopy(cm.data)
+    services = data.setdefault("services", {})
     services["datasources"] = dict(body.datasources)
-    cm.save()
 
+    override = load_project_override(cwd=svc.agent_config.project_root)
+    updated_override = None
+    if override is not None and override.default_datasource is not None:
+        if override.default_datasource not in body.datasources:
+            defaults = [name for name, config in body.datasources.items() if config.get("default") is True]
+            updated_override = deepcopy(override)
+            updated_override.default_datasource = defaults[0] if len(defaults) == 1 else None
+
+    _save_config_updates(cm, data, svc.agent_config.project_root, override, updated_override)
     await _evict_current_project(ctx.project_id or "default")
 
     return Result(success=True, data={"updated": True})
@@ -232,7 +273,8 @@ async def update_models_endpoint(
     ctx: AppContextDep,
 ) -> Result[dict]:
     """Optional full-replace `models`, optional update `target`. One must be set."""
-    if body.models is None and body.target is None:
+    target_provided = "target" in body.model_fields_set
+    if body.models is None and not target_provided:
         raise DatusException(
             ErrorCode.COMMON_FIELD_INVALID,
             message="At least one of 'models' or 'target' must be provided.",
@@ -243,7 +285,7 @@ async def update_models_endpoint(
 
     cm = configuration_manager()
 
-    if body.target is not None:
+    if target_provided and body.target is not None:
         effective_models = body.models if body.models is not None else cm.data.get("models") or {}
         if body.target not in effective_models:
             raise DatusException(
@@ -251,12 +293,36 @@ async def update_models_endpoint(
                 message=f"target '{body.target}' does not exist in models.",
             )
 
+    data = deepcopy(cm.data)
     if body.models is not None:
-        cm.data["models"] = dict(body.models)
-    if body.target is not None:
-        cm.data["target"] = body.target
-    cm.save()
+        data["models"] = dict(body.models)
+        current_target = data.get("target")
+        if not target_provided and current_target and current_target not in body.models:
+            replacement = next(iter(body.models), None)
+            if replacement is None:
+                data.pop("target", None)
+            else:
+                data["target"] = replacement
+    if target_provided:
+        if body.target is None:
+            data.pop("target", None)
+        else:
+            data["target"] = body.target
 
+    override = load_project_override(cwd=svc.agent_config.project_root)
+    updated_override = None
+    if override is not None and override.target is not None:
+        if target_provided:
+            updated_override = deepcopy(override)
+            updated_override.target = ProjectTarget(custom=body.target) if body.target is not None else None
+        elif body.models is not None:
+            current_target = override.target if isinstance(override.target, str) else override.target.custom
+            if current_target is not None and current_target not in body.models:
+                replacement = next(iter(body.models), None)
+                updated_override = deepcopy(override)
+                updated_override.target = ProjectTarget(custom=replacement) if replacement is not None else None
+
+    _save_config_updates(cm, data, svc.agent_config.project_root, override, updated_override)
     await _evict_current_project(ctx.project_id or "default")
 
     return Result(success=True, data={"updated": True})
