@@ -41,18 +41,21 @@ from datus.api.services.action_sse_converter import (
     action_to_sse_event,
 )
 from datus.api.services.background_drain import track_background_task
-from datus.api.services.chat_extensions import ChatNodeFactory
+from datus.api.services.chat_extensions import ChatNodeFactory, ChatToolBinder
 from datus.api.services.semantic_model_diff import SemanticModelSnapshot
 from datus.api.services.turn_stats import TurnStatsCollector, resolve_subagent
 from datus.cli.autocomplete import AtReferenceCompleter
 from datus.cli.execution_state import PendingInputQueue
 from datus.configuration.agent_config import AgentConfig
 from datus.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
+from datus.schemas.at_context import AtContextInput
 from datus.schemas.node_models import Metric, ReferenceSql, TableSchema
 from datus.tools.proxy.proxy_tool import apply_proxy_tools
 from datus.utils.artifact_output import session_user_scope
+from datus.utils.catalog_scope import catalog_scope_matches, catalog_scope_tokens
 from datus.utils.loggings import get_logger
 from datus.utils.path_manager import set_current_path_manager
+from datus.utils.sql_utils import parse_table_name_parts
 from datus.utils.time_utils import now_utc_iso
 from datus.utils.trace_context import (
     build_chat_trace_context,
@@ -82,19 +85,53 @@ def _release_stamp() -> Optional[str]:
 logger = get_logger(__name__)
 
 
-def _subagent_datasource(agent_config: AgentConfig, name_or_id: Optional[str]) -> Optional[str]:
-    """Resolve a direct subagent's saved datasource by configuration name or API id."""
+def _subagent_scope(agent_config: AgentConfig, name_or_id: Optional[str]) -> dict | None:
     if not name_or_id:
         return None
     for name, entry in (agent_config.agentic_nodes or {}).items():
         entry_id = entry.get("id") if isinstance(entry, dict) else getattr(entry, "id", None)
-        if name != name_or_id and entry_id != name_or_id:
-            continue
-        config = agent_config.sub_agent_config(name)
-        scope = config.get("scoped_context") if isinstance(config, dict) else getattr(config, "scoped_context", None)
-        datasource = scope.get("datasource") if isinstance(scope, dict) else getattr(scope, "datasource", None)
-        return datasource if isinstance(datasource, str) and datasource else None
+        if name == name_or_id or entry_id == name_or_id:
+            config = agent_config.sub_agent_config(name)
+            scope = (
+                config.get("scoped_context") if isinstance(config, dict) else getattr(config, "scoped_context", None)
+            )
+            if isinstance(scope, dict):
+                return scope
+            return scope.model_dump() if hasattr(scope, "model_dump") else {}
     return None
+
+
+def _subagent_datasource(agent_config: AgentConfig, name_or_id: Optional[str]) -> Optional[str]:
+    scope = _subagent_scope(agent_config, name_or_id) or {}
+    datasource = scope.get("datasource")
+    return datasource if isinstance(datasource, str) and datasource else None
+
+
+def _scoped_table_paths(
+    agent_config: AgentConfig, name_or_id: Optional[str], paths: list[str] | None
+) -> list[str] | None:
+    if not paths:
+        return paths
+    scope = _subagent_scope(agent_config, name_or_id)
+    if scope is None:
+        return paths
+
+    datasource = agent_config.current_datasource
+    bound = scope.get("datasource") or datasource
+    if scope.get("tables_by_datasource") is None and datasource != bound:
+        return []
+
+    dialect = str(agent_config.db_type or "")
+    patterns = [parse_table_name_parts(token, dialect) for token in catalog_scope_tokens(scope, datasource)]
+    visible = []
+    for path in paths:
+        try:
+            coordinates = parse_table_name_parts(path, dialect)
+        except ValueError:
+            continue
+        if any(catalog_scope_matches(coordinates, pattern) for pattern in patterns):
+            visible.append(path)
+    return visible
 
 
 HEARTBEAT_INTERVAL = 10  # seconds
@@ -540,6 +577,8 @@ class ChatTaskManager:
         policy_context: Optional[Dict[str, Any]] = None,
         stats_context: Optional[Dict[str, Any]] = None,
         on_turn_end: Optional["TurnEndCallback"] = None,
+        *,
+        tool_binder: ChatToolBinder | None = None,
     ) -> ChatTask:
         """Create a background task for the agentic loop.
             :param sub_agent_id: builtin name or custom sub-agent DB ID
@@ -716,6 +755,7 @@ class ChatTaskManager:
                 request,
                 sub_agent_id=sub_agent_id,
                 user_id=user_id,
+                **({"tool_binder": tool_binder} if tool_binder is not None else {}),
             )
         )
         task.asyncio_task = asyncio_task
@@ -844,6 +884,8 @@ class ChatTaskManager:
         request: StreamChatInput,
         sub_agent_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        *,
+        tool_binder: ChatToolBinder | None = None,
     ) -> None:
         """Execute the full agentic loop, pushing SSE events to the task buffer."""
         session_id = task.session_id
@@ -969,15 +1011,25 @@ class ChatTaskManager:
                 )
 
             async def _init_owned_node():
-                task.node = await asyncio.to_thread(_init_node)
-                return task.node
+                node = await asyncio.to_thread(_init_node)
+                task.node = node
+                if tool_binder is not None and sub_agent_id is None and interactive_enabled:
+                    from datus.agent.node.chat_agentic_node import ChatAgenticNode
+
+                    if type(node) is ChatAgenticNode and not node._is_subagent:
+
+                        def _bind_host_tools():
+                            node.install_host_tools(tool_binder(node))
+
+                        await asyncio.to_thread(_bind_host_tools)
+                return node
 
             initialization = asyncio.create_task(_init_owned_node())
             try:
                 node = await asyncio.shield(initialization)
             except asyncio.CancelledError:
-                # A running constructor cannot be stopped by cancelling its
-                # awaiter. Adopt its result before terminal cleanup can run.
+                # Worker-thread initialization cannot be stopped by cancelling
+                # its awaiter. Finish it before releasing the node.
                 async def finish_initialization():
                     await asyncio.gather(initialization, return_exceptions=True)
 
@@ -1060,7 +1112,7 @@ class ChatTaskManager:
             at_tables, at_metrics, at_sqls, at_hints = await asyncio.to_thread(
                 self._resolve_at_context,
                 agent_config,
-                request.table_paths,
+                _scoped_table_paths(agent_config, sub_agent_id, request.table_paths),
                 request.metric_paths,
                 request.sql_paths,
                 request.knowledge_paths,
@@ -1079,6 +1131,7 @@ class ChatTaskManager:
                 db_schema=request.db_schema,
                 plan_mode=request.plan_mode or False,
                 source_session_id=request.source_session_id,
+                artifact_slug=request.artifact_slug,
             )
             node.input = node_input
 
@@ -1356,6 +1409,7 @@ class ChatTaskManager:
                         else:
                             parts.append({"type": "markdown", "payload": {"content": text}})
                     task.register_message_contents(combined, parts)
+                previous_input = node.input
                 node.input = self._create_node_input(
                     user_message=combined,
                     current_node=node,
@@ -1368,7 +1422,17 @@ class ChatTaskManager:
                     db_schema=request.db_schema,
                     plan_mode=request.plan_mode or False,
                     source_session_id=None,
+                    artifact_slug=request.artifact_slug,
                 )
+                if isinstance(previous_input, AtContextInput) and isinstance(node.input, AtContextInput):
+                    from datus.tools.func_tool._visual_artifact_target import selected_visual_slug
+
+                    for kind in ("report", "dashboard"):
+                        previous_slug = selected_visual_slug(previous_input, kind)
+                        if previous_slug:
+                            node.input.studio_edit_targets[kind] = [previous_slug]
+                            # Reject conflicting cards before even a chat parent can issue a write.
+                            selected_visual_slug(node.input, kind)
 
             # 6.5 Persist this turn's @-context (table/metric/sql/knowledge refs)
             # so the history API can re-render them. Best-effort and off the
@@ -1900,6 +1964,7 @@ class ChatTaskManager:
         db_schema: Optional[str] = None,
         plan_mode: bool = False,
         source_session_id: Optional[str] = None,
+        artifact_slug: Optional[str] = None,
     ):
         """Create node input based on node type.
 
@@ -1931,6 +1996,7 @@ class ChatTaskManager:
             prompt_language="en",
             plan_mode=plan_mode,
             source_session_id=source_session_id,
+            artifact_slug=artifact_slug,
         )
 
     # ------------------------------------------------------------------
@@ -1967,32 +2033,17 @@ class ChatTaskManager:
         return event_id + 1
 
     @staticmethod
-    def _match_table_entry(flatten: Dict[str, Any], path: str) -> Optional[Dict[str, Any]]:
-        """Best-effort match when the picker's fullName != the metadata-store key.
-
-        The @-picker builds table paths from live introspection (the catalog
-        tree), while the completer indexes the schema-metadata store; the two can
-        differ in catalog presence or schema level (e.g. picker sends
-        ``default_catalog.db.table`` but the store key is ``db.schema.table``).
-        Fall back to matching the trailing components — table name, plus the
-        database when the path carries one. Returns a hit only when exactly one
-        candidate matches, so a genuinely ambiguous name never resolves to the
-        wrong table.
-        """
-        segs = [s.strip().strip('"').lower() for s in path.split(".") if s.strip()]
-        if not segs:
-            return None
-        want_table = segs[-1]
-        want_db = segs[-2] if len(segs) >= 2 else None
-        candidates: List[Dict[str, Any]] = []
-        for entry in flatten.values():
-            if str(entry.get("table_name", "")).lower() != want_table:
-                continue
-            if want_db is not None:
-                entry_db = str(entry.get("database_name", "")).lower()
-                if entry_db and entry_db != want_db:
-                    continue
-            candidates.append(entry)
+    def _match_table_entry(flatten: Dict[str, Any], coordinates: Dict[str, str]) -> Optional[Dict[str, Any]]:
+        """Allow an omitted metadata namespace only when the remaining match is unique."""
+        candidates = [
+            entry
+            for entry in flatten.values()
+            if entry.get("table_name") == coordinates["table_name"]
+            and all(
+                not provided or not entry.get(field) or entry[field] == provided
+                for field, provided in coordinates.items()
+            )
+        ]
         return candidates[0] if len(candidates) == 1 else None
 
     @staticmethod
@@ -2020,28 +2071,6 @@ class ChatTaskManager:
         if not segs:
             return [], ""
         return segs[:-1], segs[-1]
-
-    @staticmethod
-    def _synthesize_table_entry(path: str) -> Optional[Dict[str, Any]]:
-        """Build a name-only table entry from a picked path when the store can't resolve it.
-
-        Only ``table_name`` is surfaced to the prompt ("Available tables"), so an
-        empty ``definition`` is fine — the node inspects the real DDL via its own
-        ``describe_table``. ``database_name`` is a best-effort guess from the
-        leading segment for display/scoping; it isn't required for resolution.
-        """
-        segs = [s.strip().strip('"') for s in path.split(".") if s.strip()]
-        if not segs:
-            return None
-        return {
-            "identifier": path,
-            "catalog_name": "",
-            "database_name": segs[-2] if len(segs) >= 2 else "",
-            "schema_name": "",
-            "table_name": segs[-1],
-            "table_type": "table",
-            "definition": "",
-        }
 
     def _resolve_at_context(
         self,
@@ -2109,23 +2138,24 @@ class ChatTaskManager:
             table_flatten = {}
         for path in table_paths:
             try:
-                entry = table_flatten.get(path) or self._match_table_entry(table_flatten, path)
+                coordinates = parse_table_name_parts(path, str(agent_config.db_type or ""))
+                if not coordinates["table_name"]:
+                    continue
+                entry = table_flatten.get(path) or self._match_table_entry(table_flatten, coordinates)
                 if not entry:
                     # The @-picker builds table paths from live introspection, so a
                     # picked table always exists even when the schema-metadata store
                     # is empty/stale (KB not indexed for this datasource). The prompt
-                    # injection only needs the table NAME (the node's own describe_table
-                    # fetches the DDL), so synthesise a name-only entry rather than
-                    # silently dropping the reference and re-asking the user.
+                    # injection can use the selected path while describe_table
+                    # reads the live columns.
                     logger.warning(
                         "Unresolved @Table path '%s' (%d indexed tables); using name-only reference. Sample keys: %s",
                         path,
                         len(table_flatten),
                         list(table_flatten.keys())[:5],
                     )
-                    entry = self._synthesize_table_entry(path)
-                if entry:
-                    tables.append(TableSchema.from_dict(entry))
+                    entry = {**coordinates, "identifier": path, "definition": ""}
+                tables.append(TableSchema.from_dict({**entry, "reference_path": path}))
             except Exception as e:
                 logger.warning(f"Failed to resolve table path '{path}': {e}")
         return tables

@@ -5,13 +5,7 @@
 """Unit tests for report artifact tools.
 
 Covers:
-* ``ReportArtifactTools.start_new_report`` / ``bind_existing_report`` — the
-  LLM-driven intent declaration that picks "create new" vs "edit existing"
-  before any write tool runs. ``start_new_report`` takes an LLM-supplied
-  ``slug`` that doubles as the directory name; ``bind_existing_report``
-  takes the same slug.
-* ``_require_active`` guard — save_query / validate_render fail-fast when no
-  report is bound.
+* Create and explicitly target existing report artifacts.
 * ``save_query`` — column inference, SQL persistence, schema validation,
   datasource resolution failures, slug overwrite.
 * ``validate_render`` — entry point check, sqlId cross-check, allowed bare
@@ -26,6 +20,7 @@ No mocks; we use a real SQLite database wired through ``DBFuncTool`` so
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -166,7 +161,7 @@ class TestResolveRelativeImport:
 
 
 # ----------------------------------------------------------------------------- #
-# start_new_report / bind_existing_report                                       #
+# start_new_report / report_slug                                       #
 # ----------------------------------------------------------------------------- #
 
 
@@ -251,38 +246,26 @@ class TestStartNewReport:
         assert "already exists" in (result.error or "").lower()
 
 
-class TestBindExistingReport:
-    def test_binds_when_directory_and_app_jsx_exist(self, unbound_tools: ReportArtifactTools, project_root: Path):
-        existing = project_root / "reports" / "existing_demo"
-        (existing / "queries").mkdir(parents=True)
-        (existing / "render").mkdir()
-        (existing / "render" / "app.jsx").write_text("export default function R() { return null; }\n")
-
-        result = unbound_tools.bind_existing_report("existing_demo")
-        assert result.success == 1, result.error
-        assert result.result["mode"] == "edit"
-        assert result.result["report_slug"] == "existing_demo"
-        assert unbound_tools.report_slug == "existing_demo"
-        assert unbound_tools.mode == "edit"
-        assert unbound_tools.render_dir == existing / "render"
-
+class TestExistingReportTarget:
     def test_rejects_missing_directory(self, unbound_tools: ReportArtifactTools):
-        result = unbound_tools.bind_existing_report("nope")
+        result = unbound_tools.validate_render("nope")
         assert result.success == 0
         assert "not found" in (result.error or "").lower()
         assert unbound_tools.report_slug is None
 
-    def test_rejects_missing_app_jsx(self, unbound_tools: ReportArtifactTools, project_root: Path):
+    def test_rejects_incomplete_directory_without_manifest(
+        self, unbound_tools: ReportArtifactTools, project_root: Path
+    ):
         incomplete = project_root / "reports" / "partial"
         (incomplete / "queries").mkdir(parents=True)
         (incomplete / "render").mkdir()
-        result = unbound_tools.bind_existing_report("partial")
+        result = unbound_tools.validate_render("partial")
         assert result.success == 0
-        assert "render/app.jsx" in (result.error or "")
+        assert "manifest" in (result.error or "")
         assert unbound_tools.report_slug is None
 
     def test_rejects_invalid_slug_format(self, unbound_tools: ReportArtifactTools):
-        result = unbound_tools.bind_existing_report("Not-A-Valid-Slug!")
+        result = unbound_tools.validate_render("Not-A-Valid-Slug!")
         assert result.success == 0
         assert "match" in (result.error or "").lower()
 
@@ -300,14 +283,12 @@ class TestRequireActive:
         )
         assert result.success == 0
         error = (result.error or "").lower()
-        assert "no active report" in error
-        assert "start_new_report" in error
-        assert "bind_existing_report" in error
+        assert "report_slug" in error
 
     def test_validate_render_rejects_when_unbound(self, unbound_tools: ReportArtifactTools):
         result = unbound_tools.validate_render()
         assert result.success == 0
-        assert "no active report" in (result.error or "").lower()
+        assert "report_slug" in (result.error or "").lower()
 
 
 # ----------------------------------------------------------------------------- #
@@ -344,6 +325,71 @@ class TestInferColumnType:
 
 
 class TestSaveQuery:
+    def test_invalid_brief_preserves_existing_query(self, report_tools):
+        save = report_tools.save_query
+        args = dict(name="sales", goal="Compare sales", hypothesis="Sales increased")
+        assert save(sql="SELECT 1 AS total", **args).success == 1
+        queries = report_tools.queries_dir
+        before = {p.name: p.read_bytes() for p in queries.iterdir()}
+        failed = save(sql="SELECT 2 AS total", caveats="x" * 501, **args)
+        assert failed.success == 0 and "brief" in failed.error
+        assert {p.name: p.read_bytes() for p in queries.iterdir()} == before
+
+    def test_preserves_mixed_sqlite_values(self, report_tools: ReportArtifactTools, project_root: Path):
+        result = report_tools.save_query(
+            name="mixed_values",
+            sql="SELECT 7 AS value, X'6f6b' AS detail UNION ALL SELECT 'unknown', X'ff'",
+            goal="Inspect mixed data values",
+            hypothesis="The query returns a number and a status in the same column.",
+        )
+
+        assert result.success == 1, result.error
+        saved = json.loads((project_root / result.result["json_path"]).read_text(encoding="utf-8"))
+        assert saved["rows"] == [{"value": 7, "detail": "ok"}, {"value": "unknown", "detail": "ff"}]
+
+    def test_saves_projection_when_no_rows_match(self, report_tools: ReportArtifactTools, project_root: Path):
+        result = report_tools.save_query(
+            name="unmatched_sales",
+            sql="SELECT store_name, sales FROM sales WHERE month = 99",
+            goal="Sales in the selected month",
+            hypothesis="No sales were recorded in that month.",
+        )
+
+        assert result.success == 1, result.error
+        saved = json.loads((project_root / result.result["json_path"]).read_text(encoding="utf-8"))
+        assert saved["row_count"] == 0
+        assert saved["rows"] == []
+        assert [column["name"] for column in saved["columns"]] == ["store_name", "sales"]
+
+    @pytest.mark.parametrize(
+        "predicate, expected_rows",
+        [("TRUE", [{"qty": 7, "order_date": "2026-01-01"}]), ("FALSE", [])],
+    )
+    def test_preserves_duckdb_projection(self, project_root: Path, predicate: str, expected_rows: list):
+        from datus.tools.db_tools.config import DuckDBConfig
+        from datus.tools.db_tools.duckdb_connector import DuckdbConnector
+
+        connector = DuckdbConnector(DuckDBConfig(db_path=str(project_root / "orders.duckdb")))
+        db = DBFuncTool(connector_or_manager=connector)
+        try:
+            tools = ReportArtifactTools(agent_config=SimpleNamespace(project_root=str(project_root)), db_func_tool=db)
+            started = tools.start_new_report("orders", "Orders", "Orders in the selected period")
+            assert started.success == 1, started.error
+            result = tools.save_query(
+                name="orders",
+                sql=f"SELECT 1 AS qty, 7 AS qty, DATE '2026-01-01' AS order_date WHERE {predicate}",
+                goal="Orders in the selected period",
+                hypothesis="The projection includes quantity and order date.",
+            )
+
+            assert result.success == 1, result.error
+            saved = json.loads((project_root / result.result["json_path"]).read_text(encoding="utf-8"))
+            assert saved["row_count"] == len(expected_rows)
+            assert saved["rows"] == expected_rows
+            assert saved["columns"] == [{"name": "qty", "type": "integer"}, {"name": "order_date", "type": "date"}]
+        finally:
+            db.close()
+
     def test_persists_sql_and_json(self, report_tools: ReportArtifactTools, project_root: Path):
         result = report_tools.save_query(
             name="sales_by_store",

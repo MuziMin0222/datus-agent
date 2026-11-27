@@ -2339,6 +2339,66 @@ class TestChatAgenticNodePlanMode:
 class TestChatAgenticNodeRebuildTools:
     """Verify _rebuild_tools correctly assembles tools from all sources."""
 
+    def test_host_tool_survives_rebuild_without_leaking_to_another_node(
+        self, real_agent_config, mock_llm_create, monkeypatch
+    ):
+        from agents import function_tool
+
+        from datus.agent.node.chat_agentic_node import ChatAgenticNode
+        from datus.tools.registry.contracts import ToolDefinition, register_tool_definition
+
+        @function_tool
+        def host_status() -> str:
+            """Read host status."""
+            return "ready"
+
+        register_tool_definition(host_status, ToolDefinition("host_tools.host_status", "read", False))
+        node = ChatAgenticNode(
+            node_id="host-chat", description="Host chat", node_type=NodeType.TYPE_CHAT, agent_config=real_agent_config
+        )
+        with monkeypatch.context() as scoped:
+            context_tools = MagicMock(side_effect=AssertionError("Installing a host tool must not query context tools"))
+            scoped.setattr(node, "_available_context_search_tools", context_tools)
+            node.install_host_tools([host_status])
+        node.setup_tools()
+        child = ChatAgenticNode(
+            node_id="child-chat",
+            description="Child chat",
+            node_type=NodeType.TYPE_CHAT,
+            agent_config=real_agent_config,
+            is_subagent=True,
+        )
+
+        assert host_status in node.tools
+        assert node.tool_registry.get("host_status") == "host_tools"
+        assert "host_status" not in {tool.name for tool in child.tools}
+
+    @pytest.mark.parametrize("name", ["list_tables", "web_search"])
+    def test_host_tool_cannot_claim_an_unmounted_builtin_name(self, real_agent_config, mock_llm_create, name):
+        from agents import function_tool
+
+        from datus.agent.node.chat_agentic_node import ChatAgenticNode
+        from datus.tools.registry.contracts import ToolDefinition, register_tool_definition
+
+        @function_tool(name_override=name)
+        def host_tool() -> str:
+            """Read host status."""
+            return "ready"
+
+        register_tool_definition(host_tool, ToolDefinition(f"host_tools.{name}", "read", False))
+        real_agent_config.agentic_nodes["chat"] = {"tools": "filesystem_tools"}
+        node = ChatAgenticNode(
+            node_id="host-chat", description="Host chat", node_type=NodeType.TYPE_CHAT, agent_config=real_agent_config
+        )
+        original_tools = list(node.tools)
+        assert name not in {tool.name for tool in original_tools}
+
+        with pytest.raises(ValueError, match=f"Duplicate host tool: {name}"):
+            node.install_host_tools([host_tool])
+
+        node._rebuild_tools()
+        assert {tool.name for tool in node.tools} == {tool.name for tool in original_tools}
+
     def test_rebuild_tools_with_all_components(self, real_agent_config, mock_llm_create):
         """_rebuild_tools includes tools from db, context, date, filesystem, skills, sub_agent, ask_user."""
         from datus.agent.node.chat_agentic_node import ChatAgenticNode
@@ -2891,6 +2951,25 @@ class TestChatAgenticNodeHonoursConfiguredTools:
         # not receive it.
         for expected in ("add_memory", "bash", "load_skill", "web_fetch"):
             assert expected in names
+
+    @pytest.mark.parametrize("tools", ["db_tools.*", "db_tools.*, skills.*", None])
+    def test_skill_advertising_matches_the_mounted_tool_families(self, real_agent_config, mock_llm_create, tools):
+        from datus.tools.skill_tools import SkillConfig
+
+        real_agent_config.skills_config = SkillConfig(
+            directories=[str(Path(__file__).resolve().parents[3] / "data" / "skills")]
+        )
+        real_agent_config.agentic_nodes["chat"]["skills"] = "report-*"
+        node = self._node(real_agent_config, tools=tools)
+        prompt = node._finalize_system_prompt("Configured tool availability")
+        tool_names = {tool.name for tool in node.tools}
+        if tools == "db_tools.*":
+            assert "load_skill" not in tool_names
+            assert "report-generator" not in prompt
+            assert node._get_available_skills_context() == ""
+        else:
+            assert "load_skill" in tool_names
+            assert "report-generator" in prompt
 
     def test_a_selected_family_survives_the_lazy_mount(self, real_agent_config, mock_llm_create):
         """Gating is per family, not a blanket "narrowed nodes get nothing lazy"."""

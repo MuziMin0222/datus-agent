@@ -17,6 +17,7 @@ from datus.tools.func_tool.base import FuncToolResult
 from datus.tools.func_tool.database import DBFuncTool
 from datus.tools.registry.contracts import tool_contract
 from datus.utils.exceptions import DatusException
+from datus.utils.path_manager import DatusPathManager
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -955,23 +956,34 @@ class TestDescribeTableWithoutProjection:
         assert "table" not in result.result
         assert "semantic" not in result.result
 
-    def test_stale_projection_is_reported_once_per_project(self):
+    def test_stale_projection_is_reported_once_per_project(self, tmp_path):
         from datus.tools.func_tool import database as database_module
 
-        database_module._STALE_PROJECTION_WARNED.clear()
-        config = Mock()
-        config.project_name = "shop"
+        config = SimpleNamespace(
+            project_name="shop",
+            current_datasource="sales",
+            path_manager=DatusPathManager(datus_home=tmp_path, project_root=tmp_path),
+        )
+        model_dir = tmp_path / "subject" / "semantic_models" / "sales"
 
         with (
-            patch("datus.storage.semantic_dataset.store.semantic_projection_is_stale", return_value=True),
+            patch("datus.storage.registry.get_storage") as get_storage,
+            patch.object(database_module, "_STALE_PROJECTION_WARNED", set()),
             patch.object(database_module, "logger") as mock_logger,
         ):
+            get_storage.return_value._count_rows.return_value = 0
+            database_module._warn_once_if_projection_is_stale(config)
+
+            assert not model_dir.exists()
+            mock_logger.warning.assert_not_called()
+
+            model_dir.mkdir(parents=True)
+            (model_dir / "orders.yaml").write_text("name: orders\ndatasets: []\n", encoding="utf-8")
             database_module._warn_once_if_projection_is_stale(config)
             database_module._warn_once_if_projection_is_stale(config)
 
         assert mock_logger.warning.call_count == 1
         assert "sync-yaml" in mock_logger.warning.call_args.args[0]
-        database_module._STALE_PROJECTION_WARNED.clear()
 
 
 class TestSearchTableWithSharedTable:
@@ -2125,7 +2137,7 @@ class TestPathTraversalGuard:
 class TestDBFuncToolExecuteSql:
     """Tests for the unified ``execute_sql`` dispatch entry point."""
 
-    def _make_tool(self, connector=None):
+    def _make_tool(self, connector=None, agent_config=None):
         if connector is None:
             connector = Mock()
             connector.dialect = "sqlite"
@@ -2136,7 +2148,186 @@ class TestDBFuncToolExecuteSql:
         ):
             mock_rag.return_value.schema_store.table_size.return_value = 0
             mock_sem.return_value.get_size.return_value = 0
-            return DBFuncTool(connector)
+            return DBFuncTool(connector, agent_config=agent_config)
+
+    @pytest.mark.asyncio
+    async def test_registered_sql_passes_the_override_to_the_selected_connector(self, monkeypatch):
+        import asyncio
+        from types import SimpleNamespace
+
+        from datus.schemas.node_models import ExecuteSQLResult
+
+        monkeypatch.setenv("DATUS_SQL_TOOL_MAX_TIMEOUT_SECONDS", "900")
+        connector = Mock(dialect="sqlite", supports_query_timeout_override=True)
+        connector.get_databases.return_value = []
+        connector.execute_query.return_value = ExecuteSQLResult(success=True, sql_return=[{"n": 1}])
+        db = self._make_tool(connector)
+        tool = db.to_function_tool(db.execute_sql)
+        compress = Mock(wraps=db.compressor.compress)
+        monkeypatch.setattr(db.compressor, "compress", compress)
+        context = SimpleNamespace()
+        assert "1 to 900" in tool.params_json_schema["properties"]["timeout"]["description"]
+
+        sql = "SELECT 1 AS n"
+        result = await tool.on_invoke_tool(context, json.dumps({"sql": sql, "timeout": 600}))
+        assert result["success"] == 1, result
+        assert json.loads(context.tool_arguments)["timeout"] == 600
+        connector.execute_query.assert_called_once_with(sql, result_format="list", query_timeout_seconds=600)
+        compress.assert_called_once_with([{"n": 1}], row_threshold=50, token_threshold=2048)
+
+        connector.execute_query.reset_mock()
+        results = await asyncio.gather(
+            tool.on_invoke_tool(None, json.dumps({"sql": "SELECT 2 AS n", "timeout": 7})),
+            tool.on_invoke_tool(None, json.dumps({"sql": sql, "timeout": None})),
+        )
+        assert [result["success"] for result in results] == [1, 1], results
+        connector.execute_query.assert_any_call("SELECT 2 AS n", result_format="list", query_timeout_seconds=7)
+        connector.execute_query.assert_any_call(sql, result_format="list")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "override, seconds, guidance",
+        [
+            (None, 2, "Do not retry write statements without checking their outcome."),
+            (1, 1, "Check its outcome before retrying the query."),
+        ],
+    )
+    async def test_registered_sql_normalizes_a_connector_timeout_before_the_outer_timer(
+        self, monkeypatch, override, seconds, guidance
+    ):
+        import time
+
+        from datus.schemas.node_models import ExecuteSQLResult
+
+        monkeypatch.setattr("datus.tools.func_tool.database.SQL_TOOL_TIMEOUT_SECONDS", 2)
+        monkeypatch.setenv("DATUS_SQL_TOOL_MAX_TIMEOUT_SECONDS", "300")
+        connector = Mock(dialect="sqlite", supports_query_timeout_override=True, supports_read_query_timeout=True)
+        connector.get_databases.return_value = []
+        connector.execute_query.return_value = ExecuteSQLResult(success=False, error="interrupted", error_code="500007")
+        db = self._make_tool(connector)
+        tool = db.to_function_tool(db.execute_sql)
+        context = SimpleNamespace()
+        sql = "SELECT 1"
+        before = time.monotonic()
+        result = await tool.on_invoke_tool(context, json.dumps({"sql": sql, "timeout": override}))
+        after = time.monotonic()
+
+        assert result["success"] == 0
+        assert result["result"] is None
+        assert result["error"] == (
+            f"SQL tool timed out after {seconds:g} seconds. Database execution may still be running. {guidance}"
+        )
+        assert context._datus_tool_status == "timeout"
+        options = connector.execute_query.call_args.kwargs.copy()
+        assert before + seconds <= options.pop("query_deadline_monotonic") <= after + seconds
+        assert options == (
+            {"result_format": "list"}
+            if override is None
+            else {"result_format": "list", "query_timeout_seconds": override}
+        )
+        assert connector.execute_query.call_args.args == (sql,)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "sql, timeout, supported, reason",
+        [
+            ("SELECT 1", 301, True, "1 to 300"),
+            ("SELECT 1", 0, True, "1 to 300"),
+            ("SELECT 1", True, True, "1 to 300"),
+            ("SELECT 1", 1.5, True, "1 to 300"),
+            ("SELECT 1", "1", True, "1 to 300"),
+            ("SELECT 1", 1, False, "does not support"),
+            ("SELECT 1", None, False, "Unknown parameter"),
+            ("DELETE FROM example", 1, True, "only available for SELECT"),
+        ],
+    )
+    async def test_registered_sql_rejects_invalid_or_unsupported_overrides(
+        self, monkeypatch, sql, timeout, supported, reason
+    ):
+        if supported:
+            monkeypatch.delenv("DATUS_SQL_TOOL_MAX_TIMEOUT_SECONDS", raising=False)
+        else:
+            monkeypatch.setenv("DATUS_SQL_TOOL_MAX_TIMEOUT_SECONDS", "invalid")
+        connector = Mock(dialect="sqlite", supports_query_timeout_override=supported)
+        connector.get_databases.return_value = []
+        db = self._make_tool(connector)
+        tool = db.to_function_tool(db.execute_sql)
+        assert ("timeout" in tool.params_json_schema["properties"]) == supported
+        result = await tool.on_invoke_tool(None, json.dumps({"sql": sql, "timeout": timeout}))
+        assert result["success"] == 0 and reason in result["error"]
+        connector.execute_query.assert_not_called()
+        connector.execute.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "dialect, extra, supported",
+        [
+            ("dws", {}, False),
+            ("postgresql", {}, True),
+            ("postgres", {}, True),
+            ("postgresql", {"aurora": True}, False),
+            ("hive", {}, True),
+            ("hive", {"server_type": None}, True),
+            ("hive", {"server_type": "inceptor"}, False),
+        ],
+    )
+    def test_registered_sql_timeout_respects_secondary_datasource_dialect(self, monkeypatch, dialect, extra, supported):
+        """A connector's inherited capability property does not establish support for its dialect."""
+        from datus_db_core import AdapterMetadata, connector_registry
+
+        class ConfigurableConnector:
+            @property
+            def supports_query_timeout_override(self):
+                return True
+
+        config = _mock_agent_config(current_datasource="primary")
+        config.current_db_configs.return_value = {
+            "primary": DbConfig(type="hologres"),
+            "secondary": DbConfig(type=dialect, extra=extra),
+        }
+        manager = Mock(spec=DBManager)
+        manager.get_conn.return_value = Mock(dialect="hologres", supports_query_timeout_override=False)
+        registered_dialect = "postgresql" if dialect == "postgres" else dialect
+        metadata = AdapterMetadata(registered_dialect, ConfigurableConnector)
+        monkeypatch.setattr(
+            connector_registry, "get_metadata", lambda db_type: metadata if db_type == dialect else None
+        )
+
+        db = self._make_tool(manager, agent_config=config)
+        try:
+            tool = db.to_function_tool(db.execute_sql)
+            assert ("timeout" in tool.params_json_schema["properties"]) == supported
+        finally:
+            db.close()
+
+    def test_registered_sql_timeout_handles_missing_and_dict_secondary_configs(self, monkeypatch):
+        from datus_db_core import AdapterMetadata, connector_registry
+
+        class ConfigurableConnector:
+            @property
+            def supports_query_timeout_override(self):
+                return True
+
+        config = _mock_agent_config(current_datasource="primary")
+        config.current_db_configs.return_value = {
+            "primary": DbConfig(type="hologres"),
+            "secondary": {"type": "hive", "extra": {"server_type": None}},
+        }
+        manager = Mock(spec=DBManager)
+        manager.get_conn.return_value = Mock(dialect="hologres", supports_query_timeout_override=False)
+        metadata = AdapterMetadata("hive", ConfigurableConnector)
+        monkeypatch.setattr(connector_registry, "get_metadata", lambda db_type: metadata if db_type == "hive" else None)
+
+        db = self._make_tool(manager, agent_config=config)
+        try:
+            db._datasources = ["primary", "removed", "secondary"]
+            tool = db.to_function_tool(db.execute_sql)
+            assert "timeout" in tool.params_json_schema["properties"]
+
+            config.current_db_configs.return_value = {"primary": DbConfig(type="hologres")}
+            tool_without_secondary = db.to_function_tool(db.execute_sql)
+            assert "timeout" not in tool_without_secondary.params_json_schema["properties"]
+        finally:
+            db.close()
 
     @pytest.mark.asyncio
     async def test_readonly_schema_tracks_instance_policy_without_changing_write_instances(self):
@@ -2171,8 +2362,44 @@ class TestDBFuncToolExecuteSql:
 
         assert result.success == 1
         mock_connector.execute_query.assert_called_once()
+        tool.compressor.compress.assert_called_once_with([{"a": 1}], row_threshold=50, token_threshold=2048)
         # Read results are the compressor payload (carries compressed_data).
         assert result.result == {"original_rows": 1, "compressed_data": "a\n1"}
+
+    @pytest.mark.parametrize("row_count", [35, 55])
+    def test_execute_sql_previews_real_sqlite_rows(self, row_count):
+        import csv
+        from io import StringIO
+
+        from datus.tools.db_tools.config import SQLiteConfig
+        from datus.tools.db_tools.sqlite_connector import SQLiteConnector
+
+        connector = SQLiteConnector(SQLiteConfig(db_path=":memory:"))
+        sql = (
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL "
+            f"SELECT n + 1 FROM seq WHERE n < {row_count}) SELECT n FROM seq ORDER BY n"
+        )
+        all_values = list(range(1, row_count + 1))
+        try:
+            tool = self._make_tool(connector)
+            result = tool.execute_sql(sql)
+            assert result.success == 1, result.error
+            assert result.result["original_rows"] == row_count
+            rows = list(csv.DictReader(StringIO(result.result["compressed_data"])))
+            if row_count == 35:
+                assert result.result["compression_type"] == "none"
+                assert [int(row["n"]) for row in rows] == all_values
+            else:
+                assert result.result["compression_type"] == "rows"
+                assert [row["n"] for row in rows] == (
+                    [str(n) for n in all_values[:10]] + ["..."] + [str(n) for n in all_values[-10:]]
+                )
+
+            raw = tool.read_query(sql, compress=False, preview_row_threshold=50, preview_token_threshold=2048)
+            assert raw.success == 1, raw.error
+            assert raw.result == [{"n": n} for n in all_values]
+        finally:
+            connector.close()
 
     def test_insert_routes_to_execute_write(self):
         mock_connector = Mock()
@@ -2693,7 +2920,8 @@ class TestDBFuncToolExecuteReadEnforced:
         assert result.success is False
         connector.execute_query.assert_not_called()
 
-    def test_policy_rewrite_is_executed_verbatim(self):
+    @pytest.mark.parametrize("timeout", [None, 60])
+    def test_policy_rewrite_is_executed_verbatim(self, timeout):
         connector = self._connector()
         tool = self._make_tool(connector)
 
@@ -2705,10 +2933,11 @@ class TestDBFuncToolExecuteReadEnforced:
             allowed=True, result=result, applied_policies=[]
         )
         with patch("datus.tools.policy_runtime.PolicyRuntime", return_value=runtime):
-            result = tool.execute_read_enforced("SELECT 1 AS n", connector)
+            result = tool.execute_read_enforced("SELECT 1 AS n", connector, query_timeout_seconds=timeout)
 
         assert result.success is True
-        assert connector.execute_query.call_args[0][0] == "SELECT 1 AS n LIMIT 100"
+        options = {} if timeout is None else {"query_timeout_seconds": timeout}
+        connector.execute_query.assert_called_once_with("SELECT 1 AS n LIMIT 100", result_format="list", **options)
 
     def test_policy_denial_surfaces_as_failure_without_executing(self):
         connector = self._connector()
@@ -3567,13 +3796,17 @@ class TestHeaderRowNormalisation:
 
 
 @pytest.mark.asyncio
-async def test_registered_sql_timeout_is_structured_and_late_worker_cannot_replace_it(monkeypatch):
+@pytest.mark.parametrize("override, expected_seconds", [(None, 0.03), (1, 1)])
+async def test_registered_sql_timeout_is_structured_and_late_worker_cannot_replace_it(
+    monkeypatch, override, expected_seconds
+):
     """Exercise the real sync invoker; timing out must not wait for its worker."""
     import asyncio
     import threading
     from types import SimpleNamespace
 
     monkeypatch.setattr("datus.tools.func_tool.database.SQL_TOOL_TIMEOUT_SECONDS", 0.03)
+    monkeypatch.setenv("DATUS_SQL_TOOL_MAX_TIMEOUT_SECONDS", "300")
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
@@ -3582,6 +3815,7 @@ async def test_registered_sql_timeout_is_structured_and_late_worker_cannot_repla
         def __init__(self):
             self.agent_config = SimpleNamespace(sql_read_only=False)
             self._read_only = False
+            self._primary_connector = SimpleNamespace(supports_query_timeout_override=True)
 
         def _excluded_tool_params(self):
             return set()
@@ -3590,7 +3824,7 @@ async def test_registered_sql_timeout_is_structured_and_late_worker_cannot_repla
         def execute_sql(self, sql: str) -> FuncToolResult:
             started.set()
             try:
-                release.wait(timeout=2)
+                release.wait(timeout=3)
                 return FuncToolResult(result={"rows": [1]})
             finally:
                 finished.set()
@@ -3599,13 +3833,18 @@ async def test_registered_sql_timeout_is_structured_and_late_worker_cannot_repla
     tool = db.to_function_tool(db.execute_sql)
     context = SimpleNamespace()
     try:
-        result = await asyncio.wait_for(tool.on_invoke_tool(context, '{"sql":"SELECT 1"}'), timeout=1)
+        args = json.dumps({"sql": "SELECT 1", "timeout": override})
+        result = await asyncio.wait_for(tool.on_invoke_tool(context, args), timeout=2)
         assert started.is_set()
         assert not release.is_set()
         assert result["success"] == 0
         assert result["result"] is None
         assert "timed out" in result["error"]
-        assert "0.03 seconds" in result["error"]
+        assert f"{expected_seconds:g} seconds" in result["error"]
+        if override is None:
+            assert "Do not retry write statements without checking their outcome." in result["error"]
+        else:
+            assert "Check its outcome before retrying the query." in result["error"]
         assert context._datus_tool_status == "timeout"
         release.set()
         assert await asyncio.to_thread(finished.wait, 1)
@@ -3624,6 +3863,7 @@ async def test_registered_sql_preserves_real_failure_and_parent_cancellation():
         def __init__(self):
             self.agent_config = SimpleNamespace(sql_read_only=False)
             self._read_only = False
+            self._primary_connector = SimpleNamespace(supports_query_timeout_override=True)
             self.wait = False
             self.raise_timeout = False
             self.started = asyncio.Event()
