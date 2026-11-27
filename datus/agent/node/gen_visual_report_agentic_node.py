@@ -13,20 +13,13 @@ under ``<project_root>/reports/<slug>/``:
 * ``queries/<slug>.sql`` + ``queries/<slug>.json`` — per-query source + result.
 * ``manifest.json`` — ``{slug, name, description, kind, created_at}``.
 
-The artifact is consumed by:
+The CLI compiles a self-contained ``index.html`` that embeds the render files
+and queries and loads them in a sandboxed iframe.
 
-* Datus-CLI — compiles to a self-contained ``index.html`` that embeds
-  ``render/`` files + queries and loads them in a sandboxed iframe.
-* Datus-SaaS — served by the backend ``GET /api/v1/report/detail`` endpoint
-  and rendered dynamically by ``@datus/web-common/modules/report`` (also
-  iframe-sandboxed).
-
-See ``Datus-saas/docs/gen-report-artifact.md`` for the full contract this
-node enforces. Common machinery (tool setup, prompt rendering, the LLM
-loop, action-history extraction) lives in
-:class:`BaseVisualArtifactAgenticNode`; this file owns the
-report-specific artifact wiring, result model, and the CLI HTML compile
-path that has no analogue in dashboard mode.
+See ``docs/subagent/gen_visual_report.md`` for report generation and rendering.
+Common machinery (tool setup, prompt rendering, the LLM loop, and action-history
+extraction) lives in :class:`BaseVisualArtifactAgenticNode`. This node handles
+report-specific artifact wiring, the result model, and CLI HTML compilation.
 """
 
 from __future__ import annotations
@@ -44,6 +37,7 @@ from datus.tools.func_tool import (
     ReportArtifactTools,
     ReportFilesystemFuncTool,
 )
+from datus.tools.func_tool._visual_artifact_target import selected_visual_slug
 from datus.utils.artifact_output import artifact_output_root
 from datus.utils.loggings import get_logger
 
@@ -98,11 +92,14 @@ class GenVisualReportAgenticNode(BaseVisualArtifactAgenticNode[GenVisualReportNo
     # ────────── Hooks the base class calls ──────────
 
     def _make_artifact_tools(self, user_input: GenVisualReportNodeInput) -> ReportArtifactTools:
+        message = getattr(user_input, "user_message", "") or ""
         return ReportArtifactTools(
             agent_config=self.agent_config,
             db_func_tool=self.db_func_tool,
             semantic_tools=self.semantic_tools,
-            user_message=getattr(user_input, "user_message", "") or "",
+            user_message=getattr(user_input, "intent_message", None) or message,
+            intent_timestamp=getattr(user_input, "intent_timestamp", None),
+            requested_slug=selected_visual_slug(user_input, "report"),
         )
 
     def _read_artifact_slug_from_tools(self) -> Optional[str]:

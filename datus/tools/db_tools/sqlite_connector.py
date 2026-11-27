@@ -2,15 +2,18 @@
 # Licensed under the Apache License, Version 2.0.
 # See http://www.apache.org/licenses/LICENSE-2.0 for details.
 
+import math
 import sqlite3
 import threading
+import time
 from collections.abc import Callable
 from functools import wraps
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, override
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from datus_db_core import BaseSqlConnector
+from datus_db_core import BaseSqlConnector, DatusDbException
 from pandas import DataFrame
 from pyarrow import Table
 
@@ -59,6 +62,9 @@ class SQLiteConnector(BaseSqlConnector, MigrationTargetMixin):
     """
     Connector for SQLite databases using native sqlite3 SDK.
     """
+
+    supports_query_timeout_override = find_spec("datus_db_core.query_timeout") is not None
+    supports_read_query_timeout = True
 
     def __init__(self, config: SQLiteConfig):
         super().__init__(config, dialect=DBType.SQLITE)
@@ -281,31 +287,87 @@ class SQLiteConnector(BaseSqlConnector, MigrationTargetMixin):
             )
 
     @override
-    @_serialized_connection
     def execute_query(
-        self, sql: str, result_format: Literal["csv", "arrow", "pandas", "list"] = "csv"
+        self,
+        sql: str,
+        result_format: Literal["csv", "arrow", "pandas", "list"] = "csv",
+        *,
+        query_timeout_seconds: int | None = None,
+        query_deadline_monotonic: Optional[float] = None,
     ) -> ExecuteSQLResult:
         """Execute a SELECT query."""
+
+        def timeout_result(error: str = "Query deadline expired before SQL execution.") -> ExecuteSQLResult:
+            return ExecuteSQLResult(
+                success=False, error=error, error_code=ErrorCode.DB_EXECUTION_TIMEOUT.code, sql_query=sql
+            )
+
+        cursor = None
+        acquired = False
+        deadline = query_deadline_monotonic
+        interrupted = False
+        handler_installed = False
+        original_busy_timeout = None
+
+        def progress() -> int:
+            nonlocal interrupted
+            interrupted = time.monotonic() >= deadline
+            return int(interrupted)
+
         try:
+            if query_timeout_seconds is not None:
+                from datus.utils.sql_utils import is_single_select_statement
+
+                if type(query_timeout_seconds) is not int or query_timeout_seconds <= 0:
+                    raise ValueError("query_timeout_seconds must be a positive integer")
+                if not is_single_select_statement(sql, self.dialect):
+                    raise ValueError("A per-query timeout can only be set on a single SELECT query")
+                if deadline is None:
+                    deadline = time.monotonic() + query_timeout_seconds
+
+            if deadline is None:
+                acquired = self._connection_lock.acquire()
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return timeout_result()
+                acquired = self._connection_lock.acquire(timeout=max(0.0, remaining))
+                if not acquired or deadline <= time.monotonic():
+                    return timeout_result()
+
             self.connect()
             cursor = self.connection.cursor()
+            if deadline is not None:
+                busy_timeout = cursor.execute("PRAGMA busy_timeout").fetchone()[0]
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return timeout_result()
+                budget_ms = math.ceil(remaining * 1000)
+                if budget_ms < busy_timeout:
+                    original_busy_timeout = busy_timeout
+                    cursor.execute(f"PRAGMA busy_timeout = {budget_ms}")
+                self.connection.set_progress_handler(progress, 1000)
+                handler_installed = True
+
             cursor.execute(sql)
             rows = cursor.fetchall()
+            if deadline is not None and time.monotonic() >= deadline:
+                return timeout_result("Query deadline expired after fetching rows.")
             columns = [desc[0] for desc in cursor.description] if cursor.description else []
 
             # Convert to list of dicts
             result_list = [dict(zip(columns, row)) for row in rows]
             row_count = len(rows)
 
-            # Explicitly pass columns to preserve schema for empty results
-            df = DataFrame(result_list, columns=columns)
-
-            if result_format == "csv":
-                result = df.to_csv(index=False)
-            elif result_format == "arrow":
-                result = Table.from_pandas(df)
-            elif result_format == "pandas":
-                result = df
+            if result_format in {"csv", "arrow", "pandas"}:
+                # Keep the cursor's projection even when there are no rows.
+                df = DataFrame(result_list, columns=columns)
+                if result_format == "csv":
+                    result = df.to_csv(index=False)
+                elif result_format == "arrow":
+                    result = Table.from_pandas(df)
+                else:  # pandas
+                    result = df
             else:  # list
                 result = result_list
 
@@ -315,7 +377,21 @@ class SQLiteConnector(BaseSqlConnector, MigrationTargetMixin):
                 sql_return=result,
                 row_count=row_count,
                 result_format=result_format,
+                column_names=columns if not rows else None,
             )
+        except sqlite3.OperationalError as exc:
+            sqlite_code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+            if sqlite_code == sqlite3.SQLITE_INTERRUPT and interrupted:
+                return timeout_result(str(exc))
+            if (
+                sqlite_code == sqlite3.SQLITE_BUSY
+                and original_busy_timeout is not None
+                and time.monotonic() >= deadline
+            ):
+                return timeout_result(str(exc))
+            return ExecuteSQLResult(success=False, error=str(self._handle_exception(exc, sql)), sql_query=sql)
+        except DatusDbException as exc:
+            return ExecuteSQLResult(success=False, error=str(exc), sql_query=sql)
         except Exception as e:
             ex = self._handle_exception(e, sql)
             return ExecuteSQLResult(
@@ -323,6 +399,19 @@ class SQLiteConnector(BaseSqlConnector, MigrationTargetMixin):
                 error=str(ex),
                 sql_query=sql,
             )
+        finally:
+            try:
+                if handler_installed:
+                    self.connection.set_progress_handler(None, 0)
+                if original_busy_timeout is not None:
+                    cursor.execute(f"PRAGMA busy_timeout = {original_busy_timeout}")
+            finally:
+                try:
+                    if cursor is not None:
+                        cursor.close()
+                finally:
+                    if acquired:
+                        self._connection_lock.release()
 
     @override
     def execute_pandas(self, sql: str) -> ExecuteSQLResult:

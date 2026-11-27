@@ -1521,25 +1521,96 @@ class TestStartChat:
     """Tests for start_chat — background task creation."""
 
     @pytest.mark.parametrize("type_field", ["node_class", "type"])
-    async def test_old_custom_report_streams_migration_error(self, real_agent_config, type_field):
+    async def test_unknown_custom_type_streams_an_error(self, real_agent_config, type_field):
         from datus.api.models.cli_models import StreamChatInput
 
-        real_agent_config.agentic_nodes["legacy_report"] = {
-            "id": "legacy-report-id",
-            type_field: "gen_report",
+        real_agent_config.agentic_nodes["custom_agent"] = {
+            "id": "custom-agent-id",
+            type_field: "unknown_type",
         }
         manager = ChatTaskManager()
-        request = StreamChatInput(message="Create a sales report", session_id="legacy-report-session")
+        request = StreamChatInput(message="Analyze sales", session_id="custom-agent-session")
 
-        task = await manager.start_chat(real_agent_config, request, sub_agent_id="legacy-report-id")
+        task = await manager.start_chat(real_agent_config, request, sub_agent_id="custom-agent-id")
         await task.asyncio_task
         events = [event async for event in manager.consume_events(task)]
 
         assert task.status == "error"
         error = next(event.data for event in events if event.event == "error")
-        assert "legacy_report" in error.error
-        assert "Subagent 'gen_report' does not exist" in error.error
-        assert "Use 'gen_visual_report' instead" in error.error
+        assert "Unknown subagent type 'unknown_type' configured for 'custom_agent'" in error.error
+
+    @pytest.mark.parametrize(
+        ("subagent_id", "interactive", "injected"),
+        [(None, True, True), ("gen_sql", True, False), (None, False, False)],
+    )
+    async def test_host_tools_bind_only_to_the_interactive_main_node(
+        self, real_agent_config, mock_llm_create, monkeypatch, subagent_id, interactive, injected
+    ):
+        from agents import function_tool
+
+        from datus.agent.node.chat_agentic_node import ChatAgenticNode
+        from datus.api.models.cli_models import StreamChatInput
+        from datus.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+        from datus.tools.registry.contracts import ToolDefinition, register_tool_definition
+
+        @function_tool
+        def host_status() -> str:
+            """Read host status."""
+            return "ready"
+
+        register_tool_definition(host_status, ToolDefinition("host_tools.host_status", "read", False))
+        event_loop_thread = threading.get_ident()
+        thread_ids = {}
+        original_install = ChatAgenticNode.install_host_tools
+
+        def bind(node):
+            thread_ids["bind"] = threading.get_ident()
+            return [host_status]
+
+        def install(node, tools):
+            thread_ids["install"] = threading.get_ident()
+            return original_install(node, tools)
+
+        binder = MagicMock(side_effect=bind)
+        monkeypatch.setattr(ChatAgenticNode, "install_host_tools", install)
+        seen_tools = []
+
+        async def execute(node, action_history_manager):
+            seen_tools.extend(tool.name for tool in node.tools)
+            yield ActionHistory(
+                action_id="answer",
+                role=ActionRole.ASSISTANT,
+                action_type="chat_response",
+                messages="done",
+                input={},
+                output={"response": "done"},
+                status=ActionStatus.SUCCESS,
+            )
+
+        monkeypatch.setattr(ChatAgenticNode, "execute_stream_with_interactions", execute)
+        manager = ChatTaskManager()
+
+        def create_node(config, subagent_id, node_id, **kwargs):
+            return ChatAgenticNode(node_id, "Chat", "chat", agent_config=config)
+
+        # Exercise the dispatch guard even when a host returns a chat node
+        # for a targeted request.
+        monkeypatch.setattr(manager, "_create_node", create_node)
+        task = await manager.start_chat(
+            real_agent_config,
+            StreamChatInput(message="check status", interactive=interactive),
+            sub_agent_id=subagent_id,
+            tool_binder=binder,
+        )
+        await task.asyncio_task
+
+        assert task.status == "completed"
+        assert ("host_status" in seen_tools) is injected
+        assert binder.call_count == int(injected)
+        if injected:
+            assert thread_ids["bind"] == thread_ids["install"] != event_loop_thread
+        else:
+            assert thread_ids == {}
 
     async def test_start_chat_creates_task(self, real_agent_config, mock_llm_create):
         """start_chat creates a ChatTask and returns it."""
@@ -1831,6 +1902,7 @@ class TestResolveAtContext:
             tables = manager._resolve_table_paths(real_agent_config, ["db.schema.table"])
 
         assert [t.table_name for t in tables] == ["table"]
+        assert tables[0].reference_path == "db.schema.table"
 
     def test_metric_store_failure_degrades_to_hint(self, real_agent_config):
         """A store failure yields no typed metric but a look-up hint (not a silent drop)."""
@@ -3016,80 +3088,137 @@ class TestStartChatDatasourceOverride:
         assert captured["db_schema"] == "picked_schema"
 
 
-class TestMatchTableEntry:
-    """_match_table_entry — resilient @Table resolution when the picker's
-    fullName (live introspection) diverges from the metadata-store key."""
-
-    FLAT = {
-        "sample_shop.main.raw_stores": {
-            "table_name": "raw_stores",
-            "database_name": "sample_shop",
-            "schema_name": "main",
-            "definition": "x",
-            "identifier": "i",
-        },
-        "sample_shop.main.raw_orders": {
-            "table_name": "raw_orders",
-            "database_name": "sample_shop",
-            "schema_name": "main",
-            "definition": "x",
-            "identifier": "i",
-        },
+def test_catalog_reference_resolves_to_its_selected_namespace():
+    coordinates = {
+        "catalog_name": "default_catalog",
+        "database_name": "shop",
+        "schema_name": "",
+        "table_name": "revenue",
     }
+    other = {**coordinates, "catalog_name": "other_catalog"}
+    omitted = {**coordinates, "catalog_name": ""}
+    match = ChatTaskManager._match_table_entry({"other": other, "legacy": omitted}, coordinates)
+    assert match == omitted
+    assert ChatTaskManager._match_table_entry({"other": other}, coordinates) is None
 
-    def test_catalog_prefix_mismatch_resolves(self):
-        entry = ChatTaskManager._match_table_entry(self.FLAT, "default_catalog.sample_shop.raw_stores")
-        assert entry and entry["table_name"] == "raw_stores"
 
-    def test_bare_db_table_resolves(self):
-        entry = ChatTaskManager._match_table_entry(self.FLAT, "sample_shop.raw_stores")
-        assert entry and entry["table_name"] == "raw_stores"
+def test_catalog_reference_paths_are_restricted_to_the_subagent_scope():
+    from types import SimpleNamespace
 
-    def test_unknown_table_returns_none(self):
-        assert ChatTaskManager._match_table_entry(self.FLAT, "default_catalog.sample_shop.nope") is None
+    from datus.api.services.chat_task_manager import _scoped_table_paths
 
-    def test_ambiguous_without_db_returns_none(self):
-        amb = {
-            "db1.t": {"table_name": "t", "database_name": "db1"},
-            "db2.t": {"table_name": "t", "database_name": "db2"},
+    scope = {"datasource": "warehouse", "tables": "default_catalog.shop.revenue"}
+    config = SimpleNamespace(
+        agentic_nodes={"sql": {"id": "agent_id"}},
+        sub_agent_config=lambda name: {"scoped_context": scope},
+        current_datasource="warehouse",
+        db_type="starrocks",
+    )
+    paths = ["default_catalog.shop.revenue", "default_catalog.shop.orders", "other_catalog.shop.revenue"]
+    assert _scoped_table_paths(config, "agent_id", paths) == ["default_catalog.shop.revenue"]
+    assert _scoped_table_paths(config, None, paths) == paths
+
+    scope["tables"] = "default_catalog.shop.*"
+    assert _scoped_table_paths(config, "agent_id", paths) == paths[:2]
+    config.current_datasource = "other"
+    assert _scoped_table_paths(config, "agent_id", paths) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dispatched_id", "requested_id", "expected"),
+    [
+        ("sales-id", None, ["sales_view"]),
+        ("sales-id", "finance-id", ["sales_view"]),
+        (None, "sales-id", ["sales_view", "finance_view"]),
+    ],
+)
+async def test_chat_table_references_follow_the_dispatched_node(
+    real_agent_config, dispatched_id, requested_id, expected
+):
+    from datus.api.models.cli_models import StreamChatInput
+    from datus.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+
+    real_agent_config.agentic_nodes.update(
+        {
+            "sales": {"id": "sales-id", "scoped_context": {"tables": "sales_view"}},
+            "finance": {"id": "finance-id", "scoped_context": {"tables": "finance_view"}},
         }
-        assert ChatTaskManager._match_table_entry(amb, "t") is None
+    )
 
-    def test_ambiguous_disambiguated_by_db(self):
-        amb = {
-            "db1.t": {"table_name": "t", "database_name": "db1"},
-            "db2.t": {"table_name": "t", "database_name": "db2"},
-        }
-        entry = ChatTaskManager._match_table_entry(amb, "db2.t")
-        assert entry and entry["database_name"] == "db2"
+    class FakeNode:
+        session_id = "s-dispatched-table-scope"
 
-    def test_sqlite_single_level_resolves(self):
-        flat = {"raw_stores": {"table_name": "raw_stores", "definition": "x"}}
-        entry = ChatTaskManager._match_table_entry(flat, "raw_stores")
-        assert entry and entry["table_name"] == "raw_stores"
+        async def execute_stream_with_interactions(self, action_history_manager):
+            yield ActionHistory(
+                action_id="final",
+                role=ActionRole.ASSISTANT,
+                action_type="chat_response",
+                output={"response": "done"},
+                status=ActionStatus.SUCCESS,
+            )
+
+        async def get_last_turn_usage(self):
+            return None
+
+    node = FakeNode()
+    manager = ChatTaskManager(node_factory=lambda **kwargs: node)
+    request = StreamChatInput(
+        message="Query views", subagent_id=requested_id, table_paths=["sales_view", "finance_view"]
+    )
+    task = await manager.start_chat(real_agent_config, request, sub_agent_id=dispatched_id)
+    await task.asyncio_task
+
+    assert task.status == "completed", task.error
+    assert [table.reference_path for table in node.input.schemas] == expected
 
 
-class TestSynthesizeTableEntry:
-    """_synthesize_table_entry — name-only fallback when the metadata store
-    can't resolve a picked @Table (KB not indexed for the datasource)."""
+@pytest.mark.parametrize("entry", [{"id": "agent_id"}, {"id": "agent_id", "scoped_context": {}}])
+def test_named_subagent_cannot_reference_tables_without_a_scope(entry):
+    from types import SimpleNamespace
 
-    def test_three_part_path(self):
-        from datus.schemas.node_models import TableSchema
+    from datus.api.services.chat_task_manager import _scoped_table_paths
 
-        entry = ChatTaskManager._synthesize_table_entry("default_catalog.sample_shop.raw_orders")
-        assert entry["table_name"] == "raw_orders"
-        assert entry["database_name"] == "sample_shop"
-        # Must build a valid TableSchema and render to its own name in the prompt.
-        ts = TableSchema.from_dict(entry)
-        assert TableSchema.table_names_to_prompt([ts]) == "raw_orders"
+    config = SimpleNamespace(
+        agentic_nodes={"sql": entry},
+        sub_agent_config=lambda name: entry,
+        current_datasource="warehouse",
+        db_type="starrocks",
+    )
+    paths = ["default_catalog.shop.revenue"]
+    assert _scoped_table_paths(config, "agent_id", paths) == []
+    assert _scoped_table_paths(config, None, paths) == paths
 
-    def test_single_segment(self):
-        entry = ChatTaskManager._synthesize_table_entry("raw_orders")
-        assert entry["table_name"] == "raw_orders"
-        assert entry["database_name"] == ""
 
-    def test_empty_path(self):
-        assert ChatTaskManager._synthesize_table_entry("") is None
+@pytest.mark.parametrize(
+    ("grouped", "datasource", "expected"),
+    [
+        ({}, "warehouse", []),
+        ({"other": "*"}, "warehouse", []),
+        ({"warehouse": ""}, "warehouse", []),
+        ({"other": 'warehouse.public."sales.daily"'}, "other", ['warehouse.public."sales.daily"']),
+        (None, "warehouse", ['warehouse.public."sales.daily"', "warehouse.public.orders"]),
+    ],
+)
+def test_chat_references_respect_an_explicit_datasource_map(grouped, datasource, expected):
+    from types import SimpleNamespace
+
+    from datus.api.services.chat_task_manager import _scoped_table_paths
+
+    scope = {
+        "datasource": "warehouse",
+        "tables": "warehouse.public.*",
+        "tables_by_datasource": grouped,
+    }
+    entry = {"id": "agent_id", "scoped_context": scope}
+    config = SimpleNamespace(
+        agentic_nodes={"sql": entry},
+        sub_agent_config=lambda name: entry,
+        current_datasource=datasource,
+        db_type="duckdb",
+    )
+    paths = ['warehouse.public."sales.daily"', "warehouse.public.orders"]
+    assert _scoped_table_paths(config, "agent_id", paths) == expected
 
 
 class TestSplitSubjectPath:

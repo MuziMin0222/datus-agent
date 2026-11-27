@@ -6,11 +6,13 @@ import functools
 import os
 import re
 import threading
+import time
 from contextlib import contextmanager
+from importlib.util import find_spec
 from typing import Any, Callable, Dict, List, Literal, Optional, Set, TypeVar, override
 
 import duckdb
-from datus_db_core import BaseSqlConnector, SchemaNamespaceMixin, list_to_in_str
+from datus_db_core import BaseSqlConnector, DatusDbException, SchemaNamespaceMixin, list_to_in_str
 from pydantic import BaseModel, Field
 
 from datus.schemas.base import TABLE_TYPE
@@ -78,6 +80,9 @@ class DuckdbConnector(BaseSqlConnector, SchemaNamespaceMixin, MigrationTargetMix
     """
     Connector for DuckDB databases with schema support using native DuckDB SDK.
     """
+
+    supports_query_timeout_override = find_spec("datus_db_core.query_timeout") is not None
+    supports_read_query_timeout = True
 
     supports_streaming_read = True
 
@@ -635,9 +640,13 @@ class DuckdbConnector(BaseSqlConnector, SchemaNamespaceMixin, MigrationTargetMix
             )
 
     @override
-    @_serialised
     def execute_query(
-        self, sql: str, result_format: Literal["csv", "arrow", "pandas", "list"] = "csv"
+        self,
+        sql: str,
+        result_format: Literal["csv", "arrow", "pandas", "list"] = "csv",
+        *,
+        query_timeout_seconds: int | None = None,
+        query_deadline_monotonic: Optional[float] = None,
     ) -> ExecuteSQLResult:
         """Execute a SELECT query.
 
@@ -646,54 +655,92 @@ class DuckdbConnector(BaseSqlConnector, SchemaNamespaceMixin, MigrationTargetMix
         so a future regression that drops the lock can't silently return
         rows that belong to a sibling query whose state was just reset.
         """
+
+        def timeout_result(error: str = "Query deadline expired before SQL execution.") -> ExecuteSQLResult:
+            return ExecuteSQLResult(
+                success=False, error=error, error_code=ErrorCode.DB_EXECUTION_TIMEOUT.code, sql_query=sql
+            )
+
         cursor = None
+        acquired = False
+        deadline = query_deadline_monotonic
+        watcher = None
+        done = threading.Event() if deadline is not None or query_timeout_seconds is not None else None
+        expired = threading.Event() if done is not None else None
+
+        def interrupt_at_deadline() -> None:
+            if done.wait(max(0.0, deadline - time.monotonic())):
+                return
+            expired.set()
+            # DuckDB may reset an interrupt issued just before execution starts.
+            while not done.is_set():
+                cursor.interrupt()
+                done.wait(0.02)
+
         try:
+            if query_timeout_seconds is not None:
+                from datus.utils.sql_utils import is_single_select_statement
+
+                if type(query_timeout_seconds) is not int or query_timeout_seconds <= 0:
+                    raise ValueError("query_timeout_seconds must be a positive integer")
+                if not is_single_select_statement(sql, self.dialect):
+                    raise ValueError("A per-query timeout can only be set on a single SELECT query")
+                if deadline is None:
+                    deadline = time.monotonic() + query_timeout_seconds
+
+            if deadline is None:
+                acquired = self._lock.acquire()
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return timeout_result()
+                acquired = self._lock.acquire(timeout=max(0.0, remaining))
+                if not acquired or deadline <= time.monotonic():
+                    return timeout_result()
+
             self.connect()
             # DuckDB cursors are independent sessions and do not inherit SET
             # schema/USE. Copy the native session's effective search path.
             search_path = self.connection.execute("SELECT current_setting('search_path')").fetchone()[0]
             cursor = self.connection.cursor()
             cursor.execute(f"SET search_path={self._sql_literal(search_path)}")
+            if deadline is not None:
+                if deadline <= time.monotonic():
+                    return timeout_result()
+                thread = threading.Thread(target=interrupt_at_deadline, daemon=True)
+                thread.start()
+                watcher = thread
+
             result = cursor.execute(sql)
 
-            if result_format == "csv":
+            if result_format in {"csv", "pandas"}:
                 df = result.df()
-                return ExecuteSQLResult(
-                    success=True,
-                    sql_query=sql,
-                    sql_return=df.to_csv(index=False),
-                    row_count=len(df),
-                    result_format=result_format,
-                )
+                sql_return = df.to_csv(index=False) if result_format == "csv" else df
+                row_count = len(df)
             elif result_format == "arrow":
-                arrow_table = result.fetch_arrow_table()
-                return ExecuteSQLResult(
-                    success=True,
-                    sql_query=sql,
-                    sql_return=arrow_table,
-                    row_count=arrow_table.num_rows,
-                    result_format=result_format,
-                )
-            elif result_format == "pandas":
-                df = result.df()
-                return ExecuteSQLResult(
-                    success=True,
-                    sql_query=sql,
-                    sql_return=df,
-                    row_count=len(df),
-                    result_format=result_format,
-                )
+                sql_return = result.fetch_arrow_table()
+                row_count = sql_return.num_rows
             else:  # list
                 rows = result.fetchall()
                 columns = [desc[0] for desc in result.description]
-                result_list = [dict(zip(columns, row)) for row in rows]
-                return ExecuteSQLResult(
-                    success=True,
-                    sql_query=sql,
-                    sql_return=result_list,
-                    row_count=len(rows),
-                    result_format=result_format,
-                )
+                sql_return = [dict(zip(columns, row)) for row in rows]
+                row_count = len(rows)
+
+            if deadline is not None and time.monotonic() >= deadline:
+                return timeout_result("Query deadline expired after fetching rows.")
+            return ExecuteSQLResult(
+                success=True,
+                sql_query=sql,
+                sql_return=sql_return,
+                row_count=row_count,
+                result_format=result_format,
+            )
+        except duckdb.InterruptException as exc:
+            if expired is not None and expired.is_set():
+                return timeout_result(str(exc))
+            return ExecuteSQLResult(success=False, error=str(self._handle_exception(exc, sql)), sql_query=sql)
+        except DatusDbException as exc:
+            return ExecuteSQLResult(success=False, error=str(exc), sql_query=sql)
         except Exception as e:
             ex = self._handle_exception(e, sql)
             return ExecuteSQLResult(
@@ -701,10 +748,16 @@ class DuckdbConnector(BaseSqlConnector, SchemaNamespaceMixin, MigrationTargetMix
                 error=str(ex),
                 sql_query=sql,
             )
-
         finally:
-            if cursor is not None:
-                cursor.close()
+            try:
+                if watcher is not None:
+                    done.set()
+                    watcher.join()
+                if cursor is not None:
+                    cursor.close()
+            finally:
+                if acquired:
+                    self._lock.release()
 
     @override
     def execute_pandas(self, sql: str) -> ExecuteSQLResult:

@@ -7,12 +7,7 @@
 Covers:
 * Helpers: ``sql_quote_scalar``, ``resolve_bind_placeholders``,
   ``render_dashboard_template``.
-* ``DashboardArtifactTools.start_new_dashboard`` /
-  ``bind_existing_dashboard`` — LLM-driven intent declaration. The LLM
-  supplies the ``slug`` directly; the tool refuses to overwrite an
-  existing directory.
-* ``_require_active`` guard — save_query_template / validate_render fail
-  fast when no dashboard is bound.
+* Create and explicitly target existing dashboard artifacts.
 * ``save_query_template`` — header parsing, type coercion through the
   trial render, column inference, persistence on disk, error paths.
 * ``validate_render`` — entry point check, useQuerySql 2-arg requirement,
@@ -320,7 +315,7 @@ class TestExtractBindNames:
 
 
 # ----------------------------------------------------------------------------- #
-# start_new_dashboard / bind_existing_dashboard                                 #
+# start_new_dashboard / dashboard_slug                                 #
 # ----------------------------------------------------------------------------- #
 
 
@@ -398,34 +393,24 @@ class TestStartNewDashboard:
         assert "already exists" in (result.error or "").lower()
 
 
-class TestBindExistingDashboard:
-    def test_binds_when_directory_and_app_jsx_exist(self, unbound_tools: DashboardArtifactTools, project_root: Path):
-        existing = project_root / "dashboards" / "existing_demo"
-        (existing / "queries").mkdir(parents=True)
-        (existing / "render").mkdir()
-        (existing / "render" / "app.jsx").write_text("export default function D() { return null; }\n")
-
-        result = unbound_tools.bind_existing_dashboard("existing_demo")
-        assert result.success == 1, result.error
-        assert result.result["mode"] == "edit"
-        assert result.result["dashboard_slug"] == "existing_demo"
-        assert unbound_tools.dashboard_slug == "existing_demo"
-
+class TestExistingDashboardTarget:
     def test_rejects_missing_directory(self, unbound_tools: DashboardArtifactTools):
-        result = unbound_tools.bind_existing_dashboard("nope")
+        result = unbound_tools.validate_render("nope")
         assert result.success == 0
         assert "not found" in (result.error or "").lower()
 
-    def test_rejects_missing_app_jsx(self, unbound_tools: DashboardArtifactTools, project_root: Path):
+    def test_rejects_incomplete_directory_without_manifest(
+        self, unbound_tools: DashboardArtifactTools, project_root: Path
+    ):
         incomplete = project_root / "dashboards" / "partial"
         (incomplete / "queries").mkdir(parents=True)
         (incomplete / "render").mkdir()
-        result = unbound_tools.bind_existing_dashboard("partial")
+        result = unbound_tools.validate_render("partial")
         assert result.success == 0
-        assert "render/app.jsx" in (result.error or "")
+        assert "manifest" in (result.error or "")
 
     def test_rejects_invalid_slug_format(self, unbound_tools: DashboardArtifactTools):
-        result = unbound_tools.bind_existing_dashboard("Not-A-Valid-Slug!")
+        result = unbound_tools.validate_render("Not-A-Valid-Slug!")
         assert result.success == 0
         assert "match" in (result.error or "").lower()
 
@@ -444,14 +429,12 @@ class TestRequireActive:
         )
         assert result.success == 0
         error = (result.error or "").lower()
-        assert "no active dashboard" in error
-        assert "start_new_dashboard" in error
-        assert "bind_existing_dashboard" in error
+        assert "dashboard_slug" in error
 
     def test_validate_render_rejects_when_unbound(self, unbound_tools: DashboardArtifactTools):
         result = unbound_tools.validate_render()
         assert result.success == 0
-        assert "no active dashboard" in (result.error or "").lower()
+        assert "dashboard_slug" in (result.error or "").lower()
 
 
 # ----------------------------------------------------------------------------- #
@@ -470,6 +453,51 @@ _REVENUE_TEMPLATE = (
 
 
 class TestSaveQueryTemplate:
+    def test_invalid_brief_preserves_existing_query(self, dashboard_tools):
+        save = dashboard_tools.save_query_template
+        args = dict(name="sales", goal="Compare sales", hypothesis="Sales increased", sample_params={})
+        assert save(sql_template="-- @datus-params\nSELECT 1 AS total", **args).success == 1
+        queries = dashboard_tools.queries_dir
+        before = {p.name: p.read_bytes() for p in queries.iterdir()}
+        failed = save(sql_template="-- @datus-params\nSELECT 2 AS total", caveats="x" * 501, **args)
+        assert failed.success == 0 and "brief" in failed.error
+        assert {p.name: p.read_bytes() for p in queries.iterdir()} == before
+
+    def test_preserves_mixed_sqlite_values(self, dashboard_tools: DashboardArtifactTools):
+        result = dashboard_tools.save_query_template(
+            name="mixed_values",
+            sql_template=(
+                "-- @datus-params value:integer\n"
+                "SELECT :value AS value, X'6f6b' AS detail UNION ALL SELECT 'unknown', X'ff'"
+            ),
+            sample_params={"value": 7},
+            goal="Inspect mixed data values",
+            hypothesis="The query returns a number and a status in the same column.",
+        )
+
+        assert result.success == 1, result.error
+        assert result.result["preview_rows"] == [
+            {"value": 7, "detail": "ok"},
+            {"value": "unknown", "detail": "ff"},
+        ]
+
+    def test_saves_projection_when_sample_filters_match_no_rows(
+        self, dashboard_tools: DashboardArtifactTools, project_root: Path
+    ):
+        result = dashboard_tools.save_query_template(
+            name="unmatched_revenue",
+            sql_template=_REVENUE_TEMPLATE,
+            sample_params={"month_floor": "2027-01"},
+            goal="Revenue by region in the selected period",
+            hypothesis="No regions have recorded revenue in that period.",
+        )
+
+        assert result.success == 1, result.error
+        assert result.result["preview_rows"] == []
+        saved = json.loads((project_root / result.result["params_path"]).read_text(encoding="utf-8"))
+        assert saved["sample_row_count"] == 0
+        assert [column["name"] for column in saved["columns"]] == ["region", "revenue"]
+
     def test_persists_sql_and_params_json(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
         result = dashboard_tools.save_query_template(
             name="revenue_by_region",
@@ -812,6 +840,56 @@ class TestValidateRender:
         result = dashboard_tools.validate_render()
         assert result.success == 0
         assert "second `params` argument" in (result.error or "")
+
+    @pytest.mark.parametrize("argument_suffix", ["", ","])
+    def test_accepts_omitted_params_for_zero_param_template(
+        self, dashboard_tools: DashboardArtifactTools, project_root: Path, argument_suffix: str
+    ):
+        saved = dashboard_tools.save_query_template(
+            name="filter_options",
+            sql_template="-- @datus-params\nSELECT DISTINCT region FROM sales",
+            sample_params={},
+            goal="List filter options",
+            hypothesis="The dashboard filter can list every region without input.",
+        )
+        assert saved.success == 1, saved.error
+        app = (
+            "import { useDatusArtifact } from '@datus/web-artifact';\n"
+            "export default function App() {\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            f"  useQuerySql('queries/filter_options'{argument_suffix});\n"
+            "  return null;\n"
+            "}\n"
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+
+        result = dashboard_tools.validate_render()
+        assert result.success == 1, result.error
+        assert result.result["query_refs"] == ["queries/filter_options"]
+
+    @pytest.mark.parametrize(
+        ("sql_id", "expected_error"),
+        [
+            ("queries/unsaved", "not produced via save_query_template"),
+            ("queries/bad-name", "invalid literal sqlId"),
+        ],
+    )
+    def test_omitted_params_still_validates_query_reference(
+        self, dashboard_tools: DashboardArtifactTools, project_root: Path, sql_id: str, expected_error: str
+    ):
+        app = (
+            "import { useDatusArtifact } from '@datus/web-artifact';\n"
+            "export default function App() {\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            f"  useQuerySql('{sql_id}');\n"
+            "  return null;\n"
+            "}\n"
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert expected_error in (result.error or "")
 
     def test_rejects_missing_required_param_key(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
         _seed_template(dashboard_tools)

@@ -418,15 +418,13 @@ class TestInheritPendingInputQueue:
 class TestResolveNodeType:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("type_field", ["node_class", "type"])
-    async def test_old_report_task_returns_migration_error(self, task_tool, mock_agent_config, type_field):
-        mock_agent_config.agentic_nodes["legacy_report"] = {type_field: "gen_report"}
+    async def test_task_rejects_unknown_configured_type(self, task_tool, mock_agent_config, type_field):
+        mock_agent_config.agentic_nodes["custom_agent"] = {type_field: "unknown_type"}
 
-        result = await task_tool.task(type="legacy_report", prompt="Create a sales report", description="Sales")
+        result = await task_tool.task(type="custom_agent", prompt="Analyze sales", description="Sales")
 
         assert result.success == 0
-        assert "legacy_report" in result.error
-        assert "Subagent 'gen_report' does not exist" in result.error
-        assert "Use 'gen_visual_report' instead" in result.error
+        assert "Unknown subagent type 'unknown_type' configured for 'custom_agent'" in result.error
 
     def test_gen_sql_with_config(self, task_tool):
         """gen_sql resolves to TYPE_GEN_SQL using config key."""
@@ -3451,3 +3449,40 @@ def test_semantic_result_keeps_host_validation_and_reconciliation(task_tool, out
     for key, value in evidence.items():
         assert result.result[key] == value
     assert result.result["session_id"] == "semantic_session"
+
+
+@pytest.mark.parametrize("kind", ["report", "dashboard"])
+def test_visual_handoff_preserves_original_target_and_turn_across_retries(task_tool, tmp_path, kind):
+    from types import SimpleNamespace
+
+    original = f'Compare net revenue. <artifact-chart-card {kind}-slug="sales" chart-id="net" />'
+    task_tool.agent_config.workspace_root = str(tmp_path)
+    task_tool.set_parent_node(SimpleNamespace(input=SimpleNamespace(user_message=original)))
+    node = task_tool._create_builtin_node(f"gen_visual_{kind}")
+    first = task_tool._build_node_input(node, "Adjust the chart.", db_ctx={})
+    retry = task_tool._build_node_input(node, "Retry the previous edit.", db_ctx={})
+    assert getattr(retry, f"{kind}_slug") == "sales"
+    assert retry.intent_timestamp == first.intent_timestamp
+    assert retry.intent_message == original
+    assert retry.user_message == "Retry the previous edit."
+
+
+@pytest.mark.parametrize("kind", ["report", "dashboard"])
+@pytest.mark.parametrize("target", ["request", "card", "repair"])
+def test_explicit_parent_slug_falls_back_after_studio_context(task_tool, tmp_path, kind, target):
+    from types import SimpleNamespace
+
+    from datus.agent.node.chat_agentic_node import ChatAgenticNode
+    from datus.agent.node.node_factory import create_node_input
+
+    task_tool.agent_config.workspace_root = str(tmp_path)
+    message = {
+        "request": "Update the title",
+        "card": f'Update <artifact-chart-card {kind}-slug="studio" />',
+        "repair": f"Repair\n{kind} slug: studio",
+    }[target]
+    parent_input = create_node_input(message, MagicMock(spec=ChatAgenticNode), artifact_slug="requested")
+    task_tool.set_parent_node(SimpleNamespace(input=parent_input))
+    child = task_tool._create_builtin_node(f"gen_visual_{kind}")
+    result = task_tool._build_node_input(child, "Update", db_ctx={})
+    assert getattr(result, f"{kind}_slug") == ("requested" if target == "request" else "studio")

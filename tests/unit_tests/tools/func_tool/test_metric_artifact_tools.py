@@ -327,6 +327,27 @@ def test_metric_bundle_validation_rejects_mismatched_sidecars(environment, chang
     assert "Invalid saved metric query" in tools._validate_metric_queries("report")
 
 
+@pytest.mark.parametrize(
+    "cls, tool_name",
+    [(ReportArtifactTools, "save_query"), (DashboardArtifactTools, "save_query_template")],
+)
+@pytest.mark.parametrize("with_semantic_tools", [False, True])
+def test_raw_sql_tool_schema_reflects_fallback_contract(environment, cls, tool_name, with_semantic_tools):
+    tools = cls(
+        agent_config=environment.config,
+        db_func_tool=environment.db,
+        semantic_tools=environment.semantic if with_semantic_tools else None,
+    )
+    tool = next(tool for tool in tools.available_tools() if tool.name == tool_name)
+    schema = tool.params_json_schema
+    assert ("fallback_reason" in schema["required"]) is with_semantic_tools
+    assert "candidate_metrics" not in schema["required"]
+    candidates = schema["properties"]["candidate_metrics"]
+    array = next(option for option in candidates["anyOf"] if option.get("type") == "array")
+    item = schema["$defs"][array["items"]["$ref"].split("/")[-1]]
+    assert set(item["required"]) == {"path", "name"}
+
+
 def test_sql_fallback_requires_recorded_reason_and_clears_previous_metric_source(environment):
     tools, saved = _save(environment)
     assert saved.success == 1
@@ -1343,3 +1364,32 @@ metrics:
             assert response.data.rows == [{"revenue": 25.0}]
         else:
             assert json.loads((tools.queries_dir / "sales.json").read_text())["rows"] == [{"revenue": 25.0}]
+
+
+@pytest.mark.parametrize("kind", ["report", "dashboard"])
+def test_first_query_save_on_existing_artifact_records_one_intent(environment, kind):
+    env = environment
+    kwargs = {"params": [], "sample_params": {}} if kind == "dashboard" else {}
+    original, saved = _save(env, kind, **kwargs)
+    assert saved.success == 1, saved.error
+    (original.render_dir / "app.jsx").write_text("export default function App() { return null; }")
+    tools = type(original)(
+        agent_config=env.config, db_func_tool=env.db, semantic_tools=env.semantic, user_message="Compare net revenue."
+    )
+    target = {f"{kind}_slug": "demo"}
+    if kind == "report":
+        raw, metric = tools.save_query, tools.save_metric_query
+        source = {"sql": "SELECT 1 AS amount"}
+    else:
+        raw, metric = tools.save_query_template, tools.save_metric_query_template
+        source = {"sql_template": "-- @datus-params\nSELECT 1 AS amount", "sample_params": {}}
+    brief = {"name": "total", "goal": "Revenue", "hypothesis": "Measure net revenue"}
+    assert not raw(**target, **brief, **source).success
+    notes = original.analysis_dir / "intent.md"
+    assert not notes.exists()
+    result = raw(**target, **brief, **source, fallback_reason="A fixed baseline for the comparison")
+    assert result.success == 1, result.error
+    assert notes.read_text().count("Compare net revenue.") == 1
+    result = metric(**target, **brief, **kwargs, query={"metric": REF})
+    assert result.success == 1, result.error
+    assert notes.read_text().count("Compare net revenue.") == 1

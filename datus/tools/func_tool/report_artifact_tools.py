@@ -31,31 +31,37 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Literal, Optional, Set
 
+import pyarrow as pa
 from agents import Tool
+from datus_db_core import BaseSqlConnector
 
+from datus.schemas.analysis_artifacts import SubjectAssetRef
 from datus.schemas.artifact_manifest import ArtifactManifest
 from datus.schemas.gen_visual_report_models import (
     QUERY_SLUG_RE,
-    REPORT_SLUG_RE,
     ColumnSemanticType,
     QueryResultFile,
     extract_query_slug,
 )
+from datus.schemas.node_models import ExecuteSQLResult
 from datus.tools.db_tools.connection_scope import connection_scope
+from datus.tools.db_tools.sqlite_connector import SQLiteConnector
 from datus.tools.func_tool._artifact_filesystem_base import ArtifactFilesystemFuncTool
 from datus.tools.func_tool._jsx_hooks_lint import format_hook_order_issues
 from datus.tools.func_tool._visual_artifact_cards import scan_render_cards
 from datus.tools.func_tool._visual_artifact_helpers import (
-    append_intent_section,
     coerce_uses_arg,
+    raw_sql_save_tool,
+    staged_query_files,
     touch_manifest_after_save,
     utc_now_iso,
     write_query_brief,
 )
+from datus.tools.func_tool._visual_artifact_target import VisualArtifactTarget
 from datus.tools.func_tool.base import FuncToolResult, trans_to_function_tool
-from datus.tools.func_tool.metric_artifact_tools import MetricArtifactToolsMixin
+from datus.tools.func_tool.metric_artifact_tools import MetricArtifactToolsMixin, _arrow_column_type
 from datus.tools.registry.contracts import tool_contract
 from datus.utils.artifact_output import artifact_output_root, current_artifact_slug_factory
 from datus.utils.loggings import get_logger
@@ -193,6 +199,39 @@ def _normalize_value(value: Any) -> Any:
     return str(value)
 
 
+def _query_result_format(connector: BaseSqlConnector) -> Literal["list", "arrow"]:
+    # SQLite permits values of different types in the same column.
+    return "list" if isinstance(connector, SQLiteConnector) else "arrow"
+
+
+def _query_rows_and_columns(execute_result: ExecuteSQLResult) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Preserve projected columns from a zero-row query or trial."""
+    result = execute_result.sql_return
+    if isinstance(result, pa.Table):
+        # Match the row-list result's last-value behavior for repeated labels.
+        names = result.column_names
+        indices = dict(zip(names, range(result.num_columns)))
+        if len(indices) != result.num_columns:
+            result = result.select(list(indices.values()))
+        if result.num_rows == 0:
+            return [], [{"name": field.name, "type": _arrow_column_type(field.type)} for field in result.schema]
+        result = result.to_pylist()
+    if not isinstance(result, list):
+        raise ValueError("Unexpected query result format; expected an Arrow table or a list of dictionaries")
+    if any(not isinstance(row, dict) for row in result):
+        raise ValueError("Unexpected query row format; expected one dictionary per row")
+
+    if not result:
+        # SQLite's cursor descriptions provide names, but no column types.
+        names = dict.fromkeys(getattr(execute_result, "column_names", None) or [])
+        return [], [{"name": name, "type": "string"} for name in names]
+
+    rows = [{key: _normalize_value(value) for key, value in row.items()} for row in result]
+    names = dict.fromkeys(key for row in rows for key in row)
+    columns = [{"name": name, "type": _infer_column_type([row.get(name) for row in rows[:200]])} for name in names]
+    return rows, columns
+
+
 def _looks_like_select(sql: str) -> bool:
     head = sql.lstrip()
     while head.startswith("--") or head.startswith("/*"):
@@ -285,24 +324,7 @@ class ReportFilesystemFuncTool(ArtifactFilesystemFuncTool):
 
 
 class ReportArtifactTools(MetricArtifactToolsMixin):
-    """LLM-facing tools that produce the report artifact tree.
-
-    Lifecycle:
-
-    1. The owning node constructs one instance per execution with no
-       active report slug.
-    2. The LLM declares intent and binds the active report by calling
-       **exactly one** of ``start_new_report`` (create) or
-       ``bind_existing_report`` (edit). The system prompt enumerates the
-       decision criteria.
-    3. ``save_query`` writes query artifacts. ``write_file`` /
-       ``edit_file`` / ``delete_file`` (from the filesystem tool) put
-       JSX/JS/CSS under ``reports/<slug>/render/``.
-    4. ``validate_render`` is the terminal action: it walks the render
-       tree, checks the entry point, verifies every ``useQuerySql``
-       slug exists, and confirms every relative import resolves. The
-       subagent stops on its first success.
-    """
+    """Create reports and save or validate an explicitly targeted artifact."""
 
     permission_category: str = "artifact_tools"
 
@@ -312,51 +334,51 @@ class ReportArtifactTools(MetricArtifactToolsMixin):
         agent_config,
         db_func_tool,
         user_message: str = "",
+        requested_slug: str | None = None,
+        intent_timestamp: str | None = None,
         semantic_tools=None,
     ) -> None:
         self.agent_config = agent_config
         self._db_func_tool = db_func_tool
         self._semantic_tools = semantic_tools
-        # Raw user prompt that drove this node invocation — appended to
-        # analysis/intent.md verbatim when the artifact is created / bound,
-        # so the file becomes the authoritative log of what the user asked
-        # for. Empty string is a tolerated edge case (programmatic
-        # invocations / test harnesses); ``append_intent_section``
-        # silently drops whitespace-only messages, renderer error
-        # reports, and "continue / proceed" placeholders so the file
-        # stays focused on real intent.
-        self._user_message = user_message or ""
+        self._project_root = artifact_output_root(agent_config)
+        self.target = VisualArtifactTarget(self._project_root, "report", user_message, requested_slug, intent_timestamp)
 
-        project_root = artifact_output_root(agent_config)
-        if not project_root or str(project_root) == ".":
-            raise ValueError("agent_config.project_root must be a non-empty directory")
-        self._project_root = project_root
+    @property
+    def report_slug(self):
+        return self.target.slug
 
-        # Lazy state — populated by start_new_report / bind_existing_report.
-        self.report_slug: Optional[str] = None
-        self.report_dir: Optional[Path] = None
-        self.queries_dir: Optional[Path] = None
-        self.render_dir: Optional[Path] = None
-        self.analysis_dir: Optional[Path] = None
-        # "new" | "edit" — surfaced to callers that want to differentiate
-        # "fresh artifact" from "edit in-place" in their final response.
-        self.mode: Optional[str] = None
+    @property
+    def mode(self):
+        return self.target.mode
+
+    @property
+    def report_dir(self):
+        return self.target.directory
+
+    @property
+    def queries_dir(self):
+        return self.target.directory / "queries" if self.target.slug else None
+
+    @property
+    def render_dir(self):
+        return self.target.directory / "render" if self.target.slug else None
+
+    @property
+    def analysis_dir(self):
+        return self.target.directory / "analysis" if self.target.slug else None
 
     # -- public --------------------------------------------------------------
 
     def available_tools(self) -> List[Tool]:
         """Return tools registered with the agent framework."""
-        return [
+        tools = [
             trans_to_function_tool(self.start_new_report),
-            trans_to_function_tool(self.bind_existing_report),
-            # ``save_query.uses`` is a free-form ``Dict[str, List[str]]`` —
-            # strict-mode JSON schema rejects ``additionalProperties: true``
-            # which ``Dict[str, Any]`` emits. We validate the shape
-            # ourselves via :func:`coerce_uses_arg` once the call lands.
-            trans_to_function_tool(self.save_query, strict_mode=False),
+            raw_sql_save_tool(self.save_query, require_fallback_reason=self._semantic_tools is not None),
             trans_to_function_tool(self.save_metric_query, strict_mode=False),
             trans_to_function_tool(self.validate_render),
         ]
+        return self.target.configure_tools(tools)
 
     # -- intent declaration --------------------------------------------------
 
@@ -402,183 +424,7 @@ class ReportArtifactTools(MetricArtifactToolsMixin):
             user's original prompt (append-only fenced-code-block section)
             so the follow-up subagent has the raw question to anchor on.
         """
-        if not slug or not REPORT_SLUG_RE.fullmatch(slug):
-            return FuncToolResult(
-                success=0,
-                error=(
-                    f"slug must match {REPORT_SLUG_RE.pattern} (lowercase letters / digits / underscores, "
-                    f"1–80 chars); got {slug!r}. Pick a semantic identifier; the LLM is responsible for "
-                    "uniqueness within reports/."
-                ),
-            )
-        if not name or not name.strip():
-            return FuncToolResult(success=0, error="name must be a non-empty display name (any language).")
-        if not description or not description.strip():
-            return FuncToolResult(
-                success=0,
-                error="description must be a non-empty one-paragraph description of what the report covers.",
-            )
-        factory = current_artifact_slug_factory(self.agent_config)
-        if factory is not None:
-            slug = factory("report", slug)
-            if not REPORT_SLUG_RE.fullmatch(slug):
-                return FuncToolResult(success=0, error="Host returned an invalid artifact slug")
-        candidate = self._project_root / "reports" / slug
-        if candidate.exists():
-            return FuncToolResult(
-                success=0,
-                error=(
-                    f"reports/{slug}/ already exists. Pick a different slug — first `glob('reports/*')` "
-                    "to see what's taken, or call `bind_existing_report` if you meant to edit it."
-                ),
-            )
-        try:
-            manifest = ArtifactManifest(
-                slug=slug,
-                name=name.strip(),
-                description=description.strip(),
-                kind="report",
-                created_at=utc_now_iso(),
-            )
-        except Exception as exc:
-            return FuncToolResult(success=0, error=f"Manifest validation failed: {exc}")
-        return self._activate(slug, mode="new", create_dirs=True, manifest=manifest)
-
-    @tool_contract(access="restricted", direct_call=False)
-    def bind_existing_report(self, report_slug: str) -> FuncToolResult:
-        """
-        Switch the active report to an existing one and bind subsequent saves there.
-
-        Call this when the user asks to **modify / update / edit /
-        append to** a specific named report. ``save_query`` overwrites
-        same-named queries; ``write_file`` / ``edit_file`` /
-        ``delete_file`` mutate ``render/`` in-place. Use ``read_file``
-        + ``glob`` to inspect the existing tree before mutating it.
-
-        When the user references the report by its display name rather
-        than its slug (``"update the account activity report"``), the LLM
-        should first ``glob('reports/*/manifest.json')`` and read each
-        manifest's ``name`` to find the matching slug, then call this
-        tool with that slug.
-
-        Args:
-            report_slug: target report slug, e.g. ``"account_activity_q1"``.
-                Must match ``^[a-z0-9_]{1,80}$`` and the directory
-                (including ``render/app.jsx``) must already exist under
-                ``<project_root>/reports/``.
-
-        Returns:
-            FuncToolResult.result is a dict like::
-
-                {
-                    "report_slug": "<slug>",
-                    "report_dir": "reports/<slug>",
-                    "render_dir": "reports/<slug>/render",
-                    "queries_dir": "reports/<slug>/queries",
-                    "analysis_dir": "reports/<slug>/analysis",
-                    "mode": "edit",
-                }
-
-            ``analysis/intent.md`` gets a new ``### [timestamp] mode: edit``
-            section appended with the user's prompt so the running log of
-            "what the user has asked over time" stays complete.
-        """
-        if not report_slug or not REPORT_SLUG_RE.fullmatch(report_slug):
-            return FuncToolResult(
-                success=0,
-                error=f"report_slug must match {REPORT_SLUG_RE.pattern}; got {report_slug!r}",
-            )
-        candidate = self._project_root / "reports" / report_slug
-        if not candidate.is_dir():
-            return FuncToolResult(
-                success=0,
-                error=(
-                    f"Report directory not found: reports/{report_slug}. "
-                    "Use start_new_report() if you intended to create a new report."
-                ),
-            )
-        if not (candidate / "render" / "app.jsx").is_file():
-            return FuncToolResult(
-                success=0,
-                error=(
-                    f"reports/{report_slug}/render/app.jsx is missing — the report is incomplete. "
-                    "Cannot bind for editing."
-                ),
-            )
-        return self._activate(report_slug, mode="edit", create_dirs=False)
-
-    def _activate(
-        self,
-        report_slug: str,
-        *,
-        mode: str,
-        create_dirs: bool,
-        manifest: Optional[ArtifactManifest] = None,
-    ) -> FuncToolResult:
-        report_dir = self._project_root / "reports" / report_slug
-        queries_dir = report_dir / "queries"
-        render_dir = report_dir / "render"
-        analysis_dir = report_dir / "analysis"
-        manifest_path = report_dir / "manifest.json"
-        if create_dirs:
-            queries_dir.mkdir(parents=True, exist_ok=True)
-            render_dir.mkdir(parents=True, exist_ok=True)
-            analysis_dir.mkdir(parents=True, exist_ok=True)
-        manifest_rel: Optional[str] = None
-        if manifest is not None:
-            try:
-                _atomic_write_text(
-                    manifest_path,
-                    json.dumps(manifest.model_dump(), ensure_ascii=False, indent=2) + "\n",
-                )
-            except OSError as exc:
-                return FuncToolResult(success=0, error=f"Failed to write manifest.json: {exc}")
-            manifest_rel = manifest_path.relative_to(self._project_root).as_posix()
-        self.report_slug = report_slug
-        self.report_dir = report_dir
-        self.queries_dir = queries_dir
-        self.render_dir = render_dir
-        self.analysis_dir = analysis_dir
-        self.mode = mode
-
-        # Append the raw user prompt to analysis/intent.md before returning.
-        # Failure here is non-fatal — the SQL/render pipeline is the load-
-        # bearing artifact; the intent log is bonus context for the
-        # follow-up subagent. We surface the warning in the tool result so
-        # the LLM (and integration tests) can notice the regression.
-        intent_warning = append_intent_section(
-            analysis_dir,
-            user_message=self._user_message,
-            mode=mode,
-            timestamp=utc_now_iso(),
-        )
-
-        result: Dict[str, Any] = {
-            "report_slug": report_slug,
-            "report_dir": f"reports/{report_slug}",
-            "render_dir": f"reports/{report_slug}/render",
-            "queries_dir": f"reports/{report_slug}/queries",
-            "analysis_dir": f"reports/{report_slug}/analysis",
-            "mode": mode,
-        }
-        if manifest_rel:
-            result["manifest_path"] = manifest_rel
-        if intent_warning:
-            result["intent_warning"] = intent_warning
-        return FuncToolResult(result=result)
-
-    def _require_active(self, tool_name: str) -> Optional[FuncToolResult]:
-        """Return a failure result when no report is bound, else ``None``."""
-        if self.report_slug is None or self.report_dir is None or self.queries_dir is None:
-            return FuncToolResult(
-                success=0,
-                error=(
-                    f"No active report bound. Call start_new_report(slug=..., name=..., description=...) "
-                    f"to create one, or bind_existing_report(report_slug=...) to edit an existing one, "
-                    f"before calling {tool_name}()."
-                ),
-            )
-        return None
+        return self.target.create(slug, name, description, current_artifact_slug_factory(self.agent_config))
 
     @connection_scope(owner_attr="_db_func_tool")
     @tool_contract(access="restricted", direct_call=False)
@@ -592,7 +438,8 @@ class ReportArtifactTools(MetricArtifactToolsMixin):
         caveats: str = "",
         datasource: str = "",
         fallback_reason: str = "",
-        candidate_metrics: Optional[List[Dict[str, Any]]] = None,
+        candidate_metrics: Optional[List[SubjectAssetRef]] = None,
+        report_slug: str = "",
     ) -> FuncToolResult:
         """
         Run a read-only SQL, persist the SQL text, the result, AND the per-query brief sidecar.
@@ -639,6 +486,12 @@ class ReportArtifactTools(MetricArtifactToolsMixin):
                 no implicit assumptions get an empty string — filler like
                 "no caveats" is NOT acceptable.
             datasource: Logical datasource name. Empty string uses the default.
+            fallback_reason: Required when metric tools are available. Explain
+                what the inspected metrics cannot express. Permission and
+                connection failures are not semantic gaps.
+            candidate_metrics: Metrics inspected before choosing raw SQL.
+                Copy each metric's path (list of strings) and name from
+                discovery. Omit or pass [] if no relevant metric was found.
 
         Returns:
             FuncToolResult.result is a dict like::
@@ -656,9 +509,9 @@ class ReportArtifactTools(MetricArtifactToolsMixin):
             The ``columns`` block is the authoritative source for axis-type
             decisions in subsequent render/*.jsx files.
         """
-        not_bound = self._require_active("save_query")
-        if not_bound is not None:
-            return not_bound
+        error = self.target.select(report_slug)
+        if error is not None:
+            return error
         if not name or not QUERY_SLUG_RE.fullmatch(name):
             return FuncToolResult(
                 success=0,
@@ -687,7 +540,10 @@ class ReportArtifactTools(MetricArtifactToolsMixin):
         if self._semantic_tools is not None and not fallback_reason.strip():
             return FuncToolResult(
                 success=0,
-                error="Use the single-metric save tool whenever it meets the need. SQL fallback requires fallback_reason and candidate_metrics after checking metric capabilities.",
+                error=(
+                    "SQL fallback requires a non-empty fallback_reason explaining the semantic gap. "
+                    "Pass the inspected metrics as candidate_metrics entries with path and name, or [] if none were found."
+                ),
             )
         source_selection = (
             {"reason": fallback_reason.strip(), "candidate_metrics": candidate_metrics or []}
@@ -730,7 +586,7 @@ class ReportArtifactTools(MetricArtifactToolsMixin):
             # apply here too — a bare connector.execute_query would let an
             # unbounded statement reach the engine and OOM the DB backend.
             execute_result = self._db_func_tool.execute_read_enforced(
-                sql, connector, datasource=datasource, result_format="list"
+                sql, connector, datasource=datasource, result_format=_query_result_format(connector)
             )
         except Exception as exc:
             logger.exception("save_query execute_query crashed", extra={"name": name})
@@ -742,30 +598,10 @@ class ReportArtifactTools(MetricArtifactToolsMixin):
                 error=f"Query failed: {execute_result.error}",
             )
 
-        rows_raw = execute_result.sql_return or []
-        if not isinstance(rows_raw, list):
-            return FuncToolResult(
-                success=0,
-                error="Unexpected result format from connector; expected list of dicts",
-            )
-        rows: List[Dict[str, Any]] = []
-        column_names: List[str] = []
-        for row in rows_raw:
-            if not isinstance(row, dict):
-                return FuncToolResult(
-                    success=0,
-                    error="Unexpected row format from connector; expected dict per row",
-                )
-            normalized = {k: _normalize_value(v) for k, v in row.items()}
-            rows.append(normalized)
-            for key in row.keys():
-                if key not in column_names:
-                    column_names.append(key)
-
-        columns_meta: List[Dict[str, str]] = []
-        for col_name in column_names:
-            sample = [row.get(col_name) for row in rows[:200]]
-            columns_meta.append({"name": col_name, "type": _infer_column_type(sample)})
+        try:
+            rows, columns_meta = _query_rows_and_columns(execute_result)
+        except ValueError as exc:
+            return FuncToolResult(success=0, error=str(exc))
 
         if not columns_meta:
             return FuncToolResult(
@@ -811,26 +647,21 @@ class ReportArtifactTools(MetricArtifactToolsMixin):
         sql_text = "\n".join(header_parts) + "\n" + sql.rstrip() + "\n"
 
         try:
-            _atomic_write_text(sql_path, sql_text)
-            _atomic_write_text(json_path, json_blob)
-        except OSError as exc:
+            with staged_query_files(self.queries_dir, name, remove_suffixes=(".metric.json",)) as staging:
+                brief_err = write_query_brief(
+                    staging,
+                    name=name,
+                    hypothesis=hypothesis.strip(),
+                    uses=uses_obj,
+                    caveats=caveats.strip() if caveats else "",
+                    source_selection=source_selection,
+                )
+                if brief_err:
+                    raise ValueError(brief_err)
+                _atomic_write_text(staging / sql_path.name, sql_text)
+                _atomic_write_text(staging / json_path.name, json_blob)
+        except (OSError, ValueError) as exc:
             return FuncToolResult(success=0, error=f"Failed to persist query files: {exc}")
-
-        # Brief sidecar — write next, so the three-file bundle stays
-        # in sync. If this fails, the SQL+JSON pair already exists on
-        # disk; we surface the error so the LLM can retry without losing
-        # the query result.
-        brief_err = write_query_brief(
-            self.queries_dir,
-            name=name,
-            hypothesis=hypothesis.strip(),
-            uses=uses_obj,
-            caveats=caveats.strip() if caveats else "",
-            source_selection=source_selection,
-        )
-        if brief_err:
-            return FuncToolResult(success=0, error=brief_err)
-        (self.queries_dir / f"{name}.metric.json").unlink(missing_ok=True)
 
         # Refresh recency; finalize derives sources from the saved query files.
         # Failure is a warning: log it without failing the
@@ -857,10 +688,10 @@ class ReportArtifactTools(MetricArtifactToolsMixin):
         }
         if manifest_warning:
             result["manifest_warning"] = manifest_warning
-        return FuncToolResult(result=result)
+        return self.target.record_mutation(FuncToolResult(result=result))
 
     @tool_contract(access="restricted", direct_call=False)
-    def validate_render(self) -> FuncToolResult:
+    def validate_render(self, report_slug: str = "") -> FuncToolResult:
         """
         Validate the assembled render/ tree. Terminal action of this subagent.
 
@@ -906,9 +737,9 @@ class ReportArtifactTools(MetricArtifactToolsMixin):
             On failure, ``success=0`` and ``error`` lists every issue found.
             Warnings (e.g. unreferenced files) are non-fatal — fix or ignore.
         """
-        not_bound = self._require_active("validate_render")
-        if not_bound is not None:
-            return not_bound
+        error = self.target.select(report_slug)
+        if error is not None:
+            return error
 
         metric_error = self._validate_metric_queries("report")
         if metric_error:
