@@ -154,4 +154,3 @@ and the
 | A01 | `test_datasource_switch_acceptance.py::test_same_session_switches_source_before_querying_and_authoring_metrics` | Same-session A-to-B switch, different data behind identical table names, B tool results and metric scope. |
 | A11 | `test_chat_acceptance.py::test_http_running_session_consumes_queued_message_once` | Insert during an active HTTP turn, consume once, preserve session ownership, finish and accept a subsequent request. |
 | A09 | `test_semantic_session_acceptance.py::test_http_semantic_generation_finishes_and_releases_session` | Real semantic tools and persisted metric, independent query oracle, terminal task and usable follow-up session. |
-
